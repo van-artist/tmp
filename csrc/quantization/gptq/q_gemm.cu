@@ -12,7 +12,9 @@ https://github.com/qwopqwop200/GPTQ-for-LLaMa
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#ifndef USE_ROCM
 #include "compat.cuh"
+#endif
 #include "matrix_view.cuh"
 #include "qdq_2.cuh"
 #include "qdq_3.cuh"

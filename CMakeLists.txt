@@ -37,7 +37,7 @@ install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" ALL_COMPONENTS)
 set(PYTHON_SUPPORTED_VERSIONS "3.10" "3.11" "3.12" "3.13")
 
 # Supported AMD GPU architectures.
-set(HIP_SUPPORTED_ARCHS "gfx906;gfx908;gfx90a;gfx942;gfx950;gfx1030;gfx1100;gfx1101;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201")
+set(HIP_SUPPORTED_ARCHS "gfx906;gfx908;gfx90a;gfx942;gfx950;gfx1030;gfx1100;gfx1101;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201;gfx926;gfx928;gfx936")
 
 # ROCm installation prefix. Default to /opt/rocm but allow override via
 # -DROCM_PATH=/your/rocm/path when invoking cmake.
@@ -1185,7 +1185,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
 endif()
 
 # For CUDA and HIP builds also build the triton_kernels external package.
-if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
+if(VLLM_GPU_LANG STREQUAL "CUDA")
     include(cmake/external_projects/triton_kernels.cmake)
 endif()
 

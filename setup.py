@@ -22,6 +22,16 @@ from setuptools_scm import get_version
 from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
 
 
+from typing import Optional, Union
+import subprocess
+from pathlib import Path
+
+pwd = os.path.dirname(os.path.abspath(__file__))
+add_git_version = False
+if int(os.environ.get('ADD_GIT_VERSION', '0')) == 1:
+    add_git_version = True
+
+
 def load_module_from_path(module_name, path):
     spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
@@ -298,7 +308,7 @@ class cmake_build_ext(build_ext):
             os.makedirs(os.path.dirname(dst_file), exist_ok=True)
             self.copy_file(file, dst_file)
 
-        if _is_cuda() or _is_hip():
+        if _is_cuda():
             # copy vllm/third_party/triton_kernels/**/*.py from self.build_lib
             # to current directory so that they can be included in the editable
             # build
@@ -798,6 +808,94 @@ def get_nvcc_cuda_version() -> Version:
     return nvcc_cuda_version
 
 
+def get_sha(root: Union[str, Path]) -> str:
+    try:
+        return subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root).decode('ascii').strip()
+    except Exception:
+        return 'Unknown'
+
+
+def get_version_add(sha: Optional[str] = None) -> str:
+    command = "git config --global --add safe.directory "+pwd  
+    subprocess.run(command, shell=True, capture_output=False, text=True) 
+    vllm_root = os.path.dirname(os.path.abspath(__file__))
+    add_version_path = os.path.join(os.path.join(vllm_root, "vllm"), "version.py")
+    major, minor, _ = torch.__version__.split('.')
+    if add_git_version:
+        if sha != 'Unknown':
+            if sha is None:
+                sha = get_sha(vllm_root)
+            version = 'das.' + sha[:7]
+    else:
+        version = 'das'
+
+
+    # dtk version
+    if os.getenv("ROCM_PATH"):
+        rocm_path = os.getenv('ROCM_PATH', "")
+        rocm_version_path = os.path.join(rocm_path, '.info', "rocm_version")
+        with open(rocm_version_path, 'r',encoding='utf-8') as file:
+            lines = file.readlines()
+        rocm_version=lines[0].replace(".", "")
+        version += ".dtk" + rocm_version
+    
+    new_version_content = f"""
+try:
+    __version__ = "0.18.1"
+    __version_tuple__ = (0, 18, 1)
+    __hcu_version__ = f'0.18.1+{version}' 
+    
+    from vllm.version import __version__, __version_tuple__, __hcu_version__
+except Exception as e:
+    import warnings
+
+    warnings.warn(f"Failed to read commit hash:\\n + str(e)",
+                  RuntimeWarning,
+                  stacklevel=2)
+    __version__ = "dev"
+    __version_tuple__ = (0, 0, __version__)
+    
+    
+def _prev_minor_version_was(version_str):
+    '''Check whether a given version matches the previous minor version.
+
+    Return True if version_str matches the previous minor version.
+
+    For example - return True if the current version if 0.7.4 and the
+    supplied version_str is '0.6'.
+
+    Used for --show-hidden-metrics-for-version.
+    '''
+    # Match anything if this is a dev tree
+    if __version_tuple__[0:2] == (0, 0):
+        return True
+
+    # Note - this won't do the right thing when we release 1.0!
+    # assert __version_tuple__[0] == 0
+    assert isinstance(__version_tuple__[1], int)
+    return version_str == f"{{__version_tuple__[0]}}.{{__version_tuple__[1] - 1}}"
+
+
+def _prev_minor_version():
+    '''For the purpose of testing, return a previous minor version number.'''
+    # In dev tree, this will return "0.-1", but that will work fine"
+    assert isinstance(__version_tuple__[1], int)
+    return f"{{__version_tuple__[0]}}.{{__version_tuple__[1] - 1}}"
+"""
+    
+    with open(add_version_path, encoding="utf-8",mode="w") as file:
+        file.write(new_version_content)
+    file.close()
+    
+    
+def get_version():
+    get_version_add()
+    version_file = 'vllm/version.py'
+    with open(version_file, encoding='utf-8') as f:
+        exec(compile(f.read(), version_file, 'exec'))
+    return locals()['__hcu_version__']
+
+
 def get_vllm_version() -> str:
     # Allow overriding the version. This is useful to build platform-specific
     # wheels (e.g. CPU, TPU) without modifying the source.
@@ -806,8 +904,9 @@ def get_vllm_version() -> str:
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
         return get_version(write_to="vllm/_version.py")
 
-    version = get_version(write_to="vllm/_version.py")
-    sep = "+" if "+" not in version else "."  # dev versions might contain +
+    if not _is_hip():
+        version = get_version(write_to="vllm/_version.py")
+        sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():
         if envs.VLLM_TARGET_DEVICE == "empty":
@@ -824,9 +923,10 @@ def get_vllm_version() -> str:
                     version += f"{sep}cu{cuda_version_str}"
     elif _is_hip():
         # Get the Rocm Version
-        rocm_version = get_rocm_version() or torch.version.hip
-        if rocm_version and rocm_version != envs.VLLM_MAIN_CUDA_VERSION:
-            version += f"{sep}rocm{rocm_version.replace('.', '')[:3]}"
+        # rocm_version = get_rocm_version() or torch.version.hip
+        # if rocm_version and rocm_version != envs.VLLM_MAIN_CUDA_VERSION:
+        #     version += f"{sep}rocm{rocm_version.replace('.', '')[:3]}"
+        version = get_version()
     elif _is_tpu():
         version += f"{sep}tpu"
     elif _is_cpu():
@@ -892,10 +992,10 @@ if _is_cuda() or _is_hip():
     ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))
     # Optional since this doesn't get built (produce an .so file). This is just
     # copying the relevant .py files from the source repository.
-    ext_modules.append(CMakeExtension(name="vllm.triton_kernels", optional=True))
+    # ext_modules.append(CMakeExtension(name="vllm.triton_kernels", optional=True))
 
-if _is_hip():
-    ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
+# if _is_hip():
+#     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))

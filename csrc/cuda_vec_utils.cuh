@@ -8,6 +8,8 @@
 #include <cassert>
 
 #ifdef USE_ROCM
+  #include <cuda_bf16.h>
+  #include <cuda_fp16.h>
   #include <hip/hip_runtime.h>
 #else
   #include <cuda_bf16.h>
