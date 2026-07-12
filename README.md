@@ -1,3 +1,13 @@
+# PRA26 Qwen3.5-27B gfx936 optimization submission
+
+This branch is based on OpenDAS/vLLM `v0.18.1` (`fa71803`). It uses the
+existing ROCm AITER Python API and vLLM Triton attention implementation; no
+third-party source has been copied into the repository. The competition
+changes, provenance, legality notes, and measured contributions are described
+in [OPTIMIZATION.md](OPTIMIZATION.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+---
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>

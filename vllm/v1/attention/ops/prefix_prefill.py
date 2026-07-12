@@ -6,8 +6,34 @@
 
 import torch
 
+from vllm import envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+
+def _validate_rocm_prefix_prefill_tile(
+    name: str, value: int, allowed: tuple[int, ...]
+) -> int:
+    if value not in allowed:
+        raise ValueError(f"{name} must be one of {allowed}, got {value}")
+    return value
+
+
+_ROCM_PREFIX_PREFILL_TILE_M = _validate_rocm_prefix_prefill_tile(
+    "VLLM_ROCM_PREFIX_PREFILL_TILE_M",
+    envs.VLLM_ROCM_PREFIX_PREFILL_TILE_M,
+    (32, 64, 128),
+)
+_ROCM_PREFIX_PREFILL_TILE_N = _validate_rocm_prefix_prefill_tile(
+    "VLLM_ROCM_PREFIX_PREFILL_TILE_N",
+    envs.VLLM_ROCM_PREFIX_PREFILL_TILE_N,
+    (32, 64),
+)
+_ROCM_PREFIX_PREFILL_NUM_WARPS = _validate_rocm_prefix_prefill_tile(
+    "VLLM_ROCM_PREFIX_PREFILL_NUM_WARPS",
+    envs.VLLM_ROCM_PREFIX_PREFILL_NUM_WARPS,
+    (4, 8),
+)
 
 # Static kernels parameters
 BASE_BLOCK = 128 if current_platform.has_device_capability(80) else 64
@@ -786,6 +812,7 @@ def context_attention_fwd(
 
     real_block_size = v_cache.shape[3]
     is_pow2 = real_block_size > 0 and (real_block_size & (real_block_size - 1) == 0)
+    PREFIX_NUM_WARPS = 4
     # For standard models involving powers of 2,
     # follow the original logic (Llama 128/64)
     # For non-standard models (Qwen3-next block_size 544), set to 32.
@@ -795,6 +822,18 @@ def context_attention_fwd(
     else:
         BLOCK_M = 32
         BLOCK_N = 32
+        # Exact-shape tile override for the Qwen3.5-27B BF16 full-attention
+        # cache geometry. The physical KV page and the logical cache
+        # traversal tile remain unchanged.
+        if (
+            current_platform.is_rocm()
+            and real_block_size == 784
+            and Lk == 256
+            and q.dtype == torch.bfloat16
+        ):
+            BLOCK_M = _ROCM_PREFIX_PREFILL_TILE_M
+            BLOCK_N = _ROCM_PREFIX_PREFILL_TILE_N
+            PREFIX_NUM_WARPS = _ROCM_PREFIX_PREFILL_NUM_WARPS
 
     # TRITON_BLOCK_SIZE is kept at 32 to ensure
     # correct alignment logic when the kernel handles
@@ -854,7 +893,7 @@ def context_attention_fwd(
         BLOCK_N=BLOCK_N,
         num_unroll_cache=4,
         num_unroll_request=1,
-        num_warps=4,
+        num_warps=PREFIX_NUM_WARPS,
         num_stages=1,
         USE_SINKS=sinks is not None,
         **extra_kargs,

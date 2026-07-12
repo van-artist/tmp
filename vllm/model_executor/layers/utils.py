@@ -8,7 +8,7 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm import envs
-from vllm._aiter_ops import rocm_aiter_ops
+from vllm._aiter_ops import IS_AITER_FOUND, rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.platform_utils import num_compute_units
@@ -98,7 +98,64 @@ def default_unquantized_gemm(
     return torch.nn.functional.linear(x, weight, bias)
 
 
+# The installed AITER package maps gfx936 to BW200 but does not ship a
+# BW200-GEMM-A16W16 config file.  Keep the initial rollout deliberately
+# narrow and supply a static config so gemm_a16w16 never calls _get_config().
+# Shape tuple is (flattened token count, out_features, in_features).
+_GFX936_QWEN35_AITER_GEMM_CONFIGS: dict[
+    tuple[int, int, int], dict[str, object]
+] = {
+    (1, 34816, 5120): {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 512,
+        "GROUP_SIZE_M": 1,
+        "cache_modifier": None,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+    },
+    (1, 16384, 5120): {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "cache_modifier": None,
+        "num_warps": 8,
+        "num_stages": 1,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+    },
+    (1, 14336, 5120): {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "cache_modifier": None,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+    },
+}
+
+
 def use_aiter_triton_gemm(n, m, k, dtype):
+    from vllm.platforms.rocm import on_gfx936
+
+    if on_gfx936():
+        return (
+            IS_AITER_FOUND
+            and envs.VLLM_ROCM_USE_GFX936_AITER_GEMV
+            and envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
+            and dtype == torch.bfloat16
+            and (n, m, k) in _GFX936_QWEN35_AITER_GEMM_CONFIGS
+        )
+
     if (
         not rocm_aiter_ops.is_triton_gemm_enabled()
         # MI300's - fp8nuz=True
@@ -122,11 +179,44 @@ def use_aiter_triton_gemm(n, m, k, dtype):
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    from vllm.platforms.rocm import on_gfx9, on_gfx950
+    from vllm.platforms.rocm import on_gfx9, on_gfx936, on_gfx950
 
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
     k = weight.shape[1]
+
+    # gfx936 is deliberately not part of the upstream gfx9 skinny-kernel
+    # allowlist. Handle its three tuned Qwen3.5 shapes before calculating the
+    # SplitK heuristics, and send every other shape straight to the unchanged
+    # PyTorch fallback.
+    if on_gfx936():
+        if not (
+            use_aiter_triton_gemm(n, m, k, x.dtype)
+            and bias is None
+            and x.is_cuda
+            and weight.dtype == x.dtype
+            and weight.device == x.device
+            and weight.ndim == 2
+            and x.is_contiguous()
+            and weight.is_contiguous()
+        ):
+            return torch.nn.functional.linear(x, weight, bias)
+
+        try:
+            from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+        except (AttributeError, ImportError, OSError):
+            return torch.nn.functional.linear(x, weight, bias)
+
+        x_2d = x.reshape(n, k)
+        out_2d = x.new_empty((n, m))
+        out_2d = gemm_a16w16(
+            x_2d,
+            weight,
+            dtype=x.dtype,
+            y=out_2d,
+            config=_GFX936_QWEN35_AITER_GEMM_CONFIGS[(n, m, k)],
+        )
+        return out_2d.reshape(*x.shape[:-1], m)
 
     cu_count = num_compute_units()
 
@@ -162,10 +252,27 @@ def rocm_unquantized_gemm_impl(
     if use_skinny_reduce_counting:
         return ops.wvSplitKrc(x, weight, cu_count, bias)
 
-    if use_aiter_triton_gemm(n, m, k, x.dtype):
-        from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+    if (
+        use_aiter_triton_gemm(n, m, k, x.dtype)
+        and bias is None
+        and x.is_cuda
+        and weight.dtype == x.dtype
+        and weight.device == x.device
+        and weight.ndim == 2
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    ):
+        try:
+            from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+        except (AttributeError, ImportError, OSError):
+            return torch.nn.functional.linear(x, weight, bias)
 
-        return gemm_a16w16(x, weight, bias)
+        x_2d = x.reshape(n, k)
+        out_2d = x.new_empty((n, m))
+        out_2d = gemm_a16w16(
+            x_2d, weight, dtype=x.dtype, y=out_2d, config=None
+        )
+        return out_2d.reshape(*x.shape[:-1], m)
 
     use_skinny = (
         envs.VLLM_ROCM_USE_SKINNY_GEMM

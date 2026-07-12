@@ -1,0 +1,1 @@
+--compilation-config {"compile_sizes":[1]}

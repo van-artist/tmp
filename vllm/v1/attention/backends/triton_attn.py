@@ -28,6 +28,9 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.ops.prefix_prefill import (
+    context_attention_fwd as paged_context_attention_fwd,
+)
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -485,6 +488,69 @@ class TritonAttentionImpl(AttentionImpl):
         max_seqlen_q = attn_metadata.max_query_len
         max_seqlen_k = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
+
+        use_gfx936_prefix_prefill = (
+            max_seqlen_q > 1
+            and current_platform.is_rocm()
+            and self.attn_type == AttentionType.DECODER
+            and cu_seqlens_q.shape[0] == 2
+            and query.dtype == torch.bfloat16
+            and key_cache.dtype == torch.bfloat16
+            and value_cache.dtype == torch.bfloat16
+            and output_scale is None
+            and self.num_heads == 24
+            and self.num_kv_heads == 4
+            and self.head_size == 256
+            and key_cache.shape[1] == 784
+            and self.logits_soft_cap == 0
+            and not self.use_alibi_sqrt
+            and attn_metadata.mm_prefix_range_tensor is None
+        )
+        if use_gfx936_prefix_prefill:
+            from vllm.platforms.rocm import on_gfx936
+
+            if not on_gfx936():
+                use_gfx936_prefix_prefill = False
+
+        if use_gfx936_prefix_prefill:
+            # The ROCm prefix-prefill kernel expects the legacy paged-attention
+            # cache views. Reinterpret the flash-layout caches without copying:
+            # [B, T, H, D] -> K [B, H, D/x, T, x], V [B, H, D, T].
+            num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
+            x = 16 // key_cache.element_size()
+            assert head_size % x == 0
+            paged_key_cache = key_cache.view(
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                head_size // x,
+                x,
+            ).permute(0, 2, 3, 1, 4)
+            paged_value_cache = value_cache.permute(0, 2, 3, 1)
+
+            paged_context_attention_fwd(
+                q=query[:num_actual_tokens],
+                k=key[:num_actual_tokens],
+                v=value[:num_actual_tokens],
+                o=output[:num_actual_tokens],
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_cache=paged_key_cache,
+                v_cache=paged_value_cache,
+                b_loc=block_table,
+                b_start_loc=cu_seqlens_q,
+                b_seq_len=seqused_k,
+                max_seq_len=max_seqlen_k,
+                max_input_len=max_seqlen_q,
+                k_scale=layer._k_scale,
+                v_scale=layer._v_scale,
+                alibi_slopes=self.alibi_slopes,
+                sliding_window=self.sliding_window[0],
+                sm_scale=self.scale,
+                skip_decode=True,
+                fp8_out_scale=output_scale,
+                sinks=self.sinks,
+            )
+            return output
 
         seq_threshold_3D = attn_metadata.seq_threshold_3D
         num_par_softmax_segments = attn_metadata.num_par_softmax_segments

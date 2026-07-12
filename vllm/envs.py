@@ -112,6 +112,10 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
+    VLLM_ROCM_USE_GFX936_AITER_GEMV: bool = True
+    VLLM_ROCM_PREFIX_PREFILL_TILE_M: int = 64
+    VLLM_ROCM_PREFIX_PREFILL_TILE_N: int = 32
+    VLLM_ROCM_PREFIX_PREFILL_NUM_WARPS: int = 4
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
@@ -979,6 +983,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_TRITON_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_TRITON_GEMM", "True").lower() in ("true", "1")
     ),
+    # Exact-shape, BF16 decode GEMV kernels tuned for gfx936.
+    "VLLM_ROCM_USE_GFX936_AITER_GEMV": lambda: (
+        os.getenv("VLLM_ROCM_USE_GFX936_AITER_GEMV", "True").lower()
+        in ("true", "1")
+    ),
+    # Query/key tiles for the dense ROCm prefix-prefill kernel. These do not
+    # change the physical or logical KV-cache page size.
+    "VLLM_ROCM_PREFIX_PREFILL_TILE_M": lambda: int(
+        os.getenv("VLLM_ROCM_PREFIX_PREFILL_TILE_M", "64")
+    ),
+    "VLLM_ROCM_PREFIX_PREFILL_TILE_N": lambda: int(
+        os.getenv("VLLM_ROCM_PREFIX_PREFILL_TILE_N", "32")
+    ),
+    "VLLM_ROCM_PREFIX_PREFILL_NUM_WARPS": lambda: int(
+        os.getenv("VLLM_ROCM_PREFIX_PREFILL_NUM_WARPS", "4")
+    ),
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in ("true", "1")
@@ -1731,6 +1751,10 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
+        "VLLM_ROCM_USE_GFX936_AITER_GEMV",
+        "VLLM_ROCM_PREFIX_PREFILL_TILE_M",
+        "VLLM_ROCM_PREFIX_PREFILL_TILE_N",
+        "VLLM_ROCM_PREFIX_PREFILL_NUM_WARPS",
         "LD_LIBRARY_PATH",
         "VLLM_SERVER_DEV_MODE",
         "VLLM_DP_MASTER_IP",
