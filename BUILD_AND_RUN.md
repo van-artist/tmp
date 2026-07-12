@@ -27,7 +27,7 @@ export TORCH_BLAS_PREFER_HIPBLASLT=0
 vllm serve /path/to/Qwen3.5-27B \
   --served-model-name Qwen3.5-27B \
   --port 8001 --trust-remote-code --dtype bfloat16 \
-  --tensor-parallel-size 1 --max-num-seqs 128 \
+  --tensor-parallel-size 1 --max-model-len 32768 --max-num-seqs 128 \
   --max-num-batched-tokens 4096 --gpu-memory-utilization 0.95 \
   --default-chat-template-kwargs '{"enable_thinking": false}' \
   --reasoning-parser qwen3 --enable-auto-tool-choice \
