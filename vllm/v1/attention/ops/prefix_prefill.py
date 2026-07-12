@@ -186,16 +186,30 @@ def _fwd_kernel(
         # Calculate the logical block index of each of the 32 tokens
         # in the current Tile (handling cross-block cases).
         token_indices = start_n + offs_bs_n
-        bn_logical_indices = token_indices // PHYSICAL_BLOCK_SIZE
+        if PHYSICAL_BLOCK_SIZE == 784 and BLOCK_SIZE == 32:
+            # Qwen3.5's hybrid-cache page is 784 tokens.  Avoid 32 vector
+            # integer divisions and remainders on every context tile: compute
+            # the page/remainder once for the tile and only select the next
+            # page for the rare tile that crosses a physical boundary.
+            page_index = start_n // PHYSICAL_BLOCK_SIZE
+            page_offset = start_n - page_index * PHYSICAL_BLOCK_SIZE
+            crosses_page = offs_bs_n >= PHYSICAL_BLOCK_SIZE - page_offset
+            bn_logical_indices = page_index + crosses_page.to(tl.int32)
+            internal_offsets = (
+                page_offset
+                + offs_bs_n
+                - crosses_page.to(tl.int32) * PHYSICAL_BLOCK_SIZE
+            )
+        else:
+            bn_logical_indices = token_indices // PHYSICAL_BLOCK_SIZE
+            internal_offsets = token_indices % PHYSICAL_BLOCK_SIZE
 
-        # 2. Vectorized loading of physical block IDs from B_Loc
+        # Vectorized loading of physical block IDs from B_Loc.
         bn = tl.load(
-            B_Loc + cur_batch * stride_b_loc_b + bn_logical_indices * stride_b_loc_s
+            B_Loc
+            + cur_batch * stride_b_loc_b
+            + bn_logical_indices * stride_b_loc_s
         ).to(tl.int64)
-
-        # 3. Calculate the exact offset of
-        # each token within its physical block.
-        internal_offsets = token_indices % PHYSICAL_BLOCK_SIZE
 
         # Addressing of K (5D)
         off_k = (

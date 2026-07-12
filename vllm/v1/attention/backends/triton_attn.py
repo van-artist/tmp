@@ -513,6 +513,27 @@ class TritonAttentionImpl(AttentionImpl):
                 use_gfx936_prefix_prefill = False
 
         if use_gfx936_prefix_prefill:
+            # A prompt's first scheduler chunk has no cached prefix.  The
+            # dense causal prefill kernel avoids all page-table arithmetic and
+            # uses a wider K/V tile, while still writing exactly the same KV
+            # entries through do_kv_cache_update() before this call.  Later
+            # chunks continue through the paged kernel below.
+            if max_seqlen_k == max_seqlen_q:
+                context_attention_fwd(
+                    q=query[:num_actual_tokens],
+                    k=key[:num_actual_tokens],
+                    v=value[:num_actual_tokens],
+                    o=output[:num_actual_tokens],
+                    b_start_loc=cu_seqlens_q,
+                    b_seq_len=seqused_k,
+                    max_input_len=max_seqlen_q,
+                    is_causal=True,
+                    softmax_scale=self.scale,
+                    sliding_window_q=self.sliding_window[0],
+                    sliding_window_k=self.sliding_window[1],
+                )
+                return output
+
             # The ROCm prefix-prefill kernel expects the legacy paged-attention
             # cache views. Reinterpret the flash-layout caches without copying:
             # [B, T, H, D] -> K [B, H, D/x, T, x], V [B, H, D, T].
