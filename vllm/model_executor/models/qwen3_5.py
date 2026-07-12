@@ -138,9 +138,20 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> MergedColumnParallelLinear:
+        # The tiny b/a projection has only 96 outputs for Qwen3.5-27B versus
+        # 16,384 q/k/v/z outputs.  Packing all six checkpoint shards into one
+        # projection removes one GEMM and one launch in every one of the 48
+        # GDN layers at negligible extra work.
         return MergedColumnParallelLinear(
             input_size=hidden_size,
-            output_sizes=[key_dim, key_dim, value_dim, value_dim],
+            output_sizes=[
+                key_dim,
+                key_dim,
+                value_dim,
+                value_dim,
+                self.num_v_heads,
+                self.num_v_heads,
+            ],
             bias=False,
             quant_config=quant_config,
             prefix=prefix,
@@ -152,17 +163,11 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         num_v_heads: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
-    ) -> MergedColumnParallelLinear:
-        # Qwen3.5 has separate in_proj_b and in_proj_a weights in the
-        # checkpoint, which are loaded into the fused in_proj_ba parameter
-        # via stacked_params_mapping with shard_id 0 and 1 respectively.
-        return MergedColumnParallelLinear(
-            input_size=hidden_size,
-            output_sizes=[num_v_heads] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=prefix,
-        )
+    ) -> nn.Module:
+        # The parent class owns this attribute for Qwen3-Next.  Qwen3.5 packs
+        # b/a into in_proj_qkvz above; retain a parameter-free placeholder so
+        # the shared initialization remains unchanged.
+        return nn.Identity()
 
     def forward(
         self,
@@ -180,12 +185,14 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        mixed_qkvzba, _ = self.in_proj_qkvz(hidden_states)
         qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
         z_size = self.value_dim // self.tp_size
-        mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+        ba_size = 2 * self.num_v_heads // self.tp_size
+        mixed_qkv, z, ba = mixed_qkvzba.split(
+            [qkv_size, z_size, ba_size], dim=-1
+        )
         z = z.reshape(z.size(0), -1, self.head_v_dim)
-        ba, _ = self.in_proj_ba(hidden_states)
         b, a = ba.chunk(2, dim=-1)
 
         b = b.contiguous()
@@ -395,8 +402,8 @@ class Qwen3_5Model(Qwen3NextModel):
             # GDN
             ("in_proj_qkvz", "in_proj_qkv", (0, 1, 2)),
             ("in_proj_qkvz", "in_proj_z", 3),
-            ("in_proj_ba", "in_proj_b", 0),
-            ("in_proj_ba", "in_proj_a", 1),
+            ("in_proj_qkvz", "in_proj_b", 4),
+            ("in_proj_qkvz", "in_proj_a", 5),
         ]
 
         params_dict = dict(self.named_parameters())
@@ -551,8 +558,12 @@ class Qwen3_5ForCausalLMBase(
         ],
         "gate_up_proj": ["gate_proj", "up_proj"],
         # GDN fused projections.
-        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
-        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        "in_proj_qkvz": [
+            "in_proj_qkv",
+            "in_proj_z",
+            "in_proj_b",
+            "in_proj_a",
+        ],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -661,8 +672,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
     supports_multimodal_pruning = False
 
     packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping | {
-        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
-        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        "in_proj_qkvz": [
+            "in_proj_qkv",
+            "in_proj_z",
+            "in_proj_b",
+            "in_proj_a",
+        ],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):

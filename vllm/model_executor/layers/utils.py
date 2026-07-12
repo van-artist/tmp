@@ -129,6 +129,21 @@ _GFX936_QWEN35_AITER_GEMM_CONFIGS: dict[
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     },
+    # Six-way Qwen3.5 GDN projection: the 16,384 q/k/v/z outputs plus the
+    # 96 b/a scalars.  It uses the proven neighboring-shape launch geometry;
+    # masking handles the final partial N tile.
+    (1, 16480, 5120): {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "cache_modifier": None,
+        "num_warps": 8,
+        "num_stages": 1,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+    },
     (1, 14336, 5120): {
         "BLOCK_SIZE_M": 16,
         "BLOCK_SIZE_N": 256,
