@@ -27,9 +27,6 @@ checkpoint conversion is used.
    traversal tile and physical page remain 32/32/784. This halves query-side
    programs without changing any attention element or causal mask. Four warps
    is retained; 8 warps and M=128 were measured and rejected.
-4. **Batch-1 static compilation candidate.** `compile_sizes=[1]` is supplied in
-   `serve_args.txt`. Default FULL_AND_PIECEWISE graph capture already includes
-   batch 1; this only requests a static Inductor specialization.
 
 ## Measured screening results
 
@@ -60,6 +57,9 @@ release gate because GEMM reduction order is not bit-identical.
 
 ## Rejected experiments
 
+- Batch-1 static compilation (`compile_sizes=[1]`): engine initialization
+  failed after compiling the singleton and dynamic ranges. The proven default
+  FULL_AND_PIECEWISE graph configuration is retained.
 - gfx936 `wvSplitK`: compiled only after replacing an unsupported dot
   instruction, but failed numerical validation (91.4% outside tolerance).
 - Full ROCM_ATTN: prefill improved but decode TPOT regressed to 117-173 ms.

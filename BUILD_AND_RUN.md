@@ -31,8 +31,7 @@ vllm serve /path/to/Qwen3.5-27B \
   --max-num-batched-tokens 4096 --gpu-memory-utilization 0.95 \
   --default-chat-template-kwargs '{"enable_thinking": false}' \
   --reasoning-parser qwen3 --enable-auto-tool-choice \
-  --tool-call-parser qwen3_coder \
-  --compilation-config '{"compile_sizes":[1]}'
+  --tool-call-parser qwen3_coder
 ```
 
 The scheduler and locked competition arguments must not be changed.
