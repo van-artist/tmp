@@ -23,15 +23,18 @@ guards. Unsupported shapes and environments retain the upstream path.
    split/AITER variant was slower. Weights remain BF16 in their original
    layout.
 2. **Exact 784-page gather plus dense ROCm FlashAttention.** The normal decode
-   path remains paged `TRITON_ATTN`. For a single Qwen3.5 BF16 prefill request,
-   a page-major Triton kernel gathers the exact interleaved
+   path and a prompt's first scheduler chunk remain on paged `TRITON_ATTN`.
+   For each continuation chunk of a single Qwen3.5 BF16 prefill request, a
+   page-major Triton kernel gathers the exact interleaved
    `[block, 2, 784, 4, 256]` K/V values into one builder-owned dense scratch
    buffer, followed by the fixed environment's variable-length ROCm
    FlashAttention. The scratch is 128 MiB at the 32K limit, shared by all full
    attention layers and used only during the synchronous prefill call. It is
    neither a persistent KV representation nor one allocation per layer.
-   Decode, mixed batches, capture, cascade, cross-attention, sliding-window,
-   ALiBi, sinks and every other geometry fall back unchanged.
+   Keeping the first chunk on the original reduction order minimizes accuracy
+   risk for only about 39.5 ms per request in the measured model. Decode,
+   mixed batches, capture, cascade, cross-attention, sliding-window, ALiBi,
+   sinks and every other geometry fall back unchanged.
 3. **Qwen3.5 GDN prefill fusion.** Projection splitting, convolution input
    preparation, recurrent-state packing, gated RMSNorm and post-convolution
    work are specialized for the official single-request 4096-token chunks.

@@ -597,31 +597,10 @@ class TritonAttentionImpl(AttentionImpl):
                 use_gfx936_prefix_prefill = False
 
         if use_gfx936_prefix_prefill:
-            # A prompt's first scheduler chunk has no cached prefix.  The
-            # dense causal prefill kernel avoids all page-table arithmetic and
-            # uses a wider K/V tile, while still writing exactly the same KV
-            # entries through do_kv_cache_update() before this call.
-            if max_seqlen_k == max_seqlen_q:
-                from flash_attn import vllm_flash_attn_varlen_func
-
-                vllm_flash_attn_varlen_func(
-                    query[:num_actual_tokens],
-                    key[:num_actual_tokens],
-                    value[:num_actual_tokens],
-                    max_seqlen_q,
-                    cu_seqlens_q,
-                    max_seqlen_k,
-                    cu_seqlens_k=cu_seqlens_q,
-                    dropout_p=0.0,
-                    softmax_scale=self.scale,
-                    causal=True,
-                    window_size=list(self.sliding_window),
-                    out=output[:num_actual_tokens],
-                    is_prefix_cache=False,
-                    fa_version=2,
-                )
-                return output
-
+            # Keep the first scheduler chunk on the numerically conservative
+            # paged Triton path.  Dense Flash is used only after a prefix has
+            # already been cached, where paired kernel differences are much
+            # smaller and the long-context speedup is concentrated.
             dense_key = attn_metadata.gfx936_dense_key
             dense_value = attn_metadata.gfx936_dense_value
             cu_seqlens_k = attn_metadata.gfx936_cu_seqlens_k
