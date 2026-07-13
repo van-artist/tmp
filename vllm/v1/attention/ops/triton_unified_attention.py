@@ -993,14 +993,19 @@ def unified_attention(
         # M is flattened over query-token/GQA-head rows. The guarded knobs let
         # the exact evaluator shape select between the two useful occupancy
         # points without exposing arbitrary compile configurations.
+        large_qwen35_prefill = max_seqlen_q >= 256
         BLOCK_M = _qwen35_prefill_tuning(
-            "VLLM_ROCM_QWEN35_UNIFIED_BLOCK_M", 64, (64, 128)
+            "VLLM_ROCM_QWEN35_UNIFIED_BLOCK_M",
+            128 if large_qwen35_prefill else 16,
+            (16, 64, 128),
         )
         QWEN35_TILE_SIZE = _qwen35_prefill_tuning(
-            "VLLM_ROCM_QWEN35_UNIFIED_TILE_SIZE", 32, (32, 64)
+            "VLLM_ROCM_QWEN35_UNIFIED_TILE_SIZE", 64, (32, 64)
         )
         QWEN35_NUM_WARPS = _qwen35_prefill_tuning(
-            "VLLM_ROCM_QWEN35_UNIFIED_NUM_WARPS", 4, (4, 8)
+            "VLLM_ROCM_QWEN35_UNIFIED_NUM_WARPS",
+            4 if large_qwen35_prefill else 2,
+            (2, 4, 8),
         )
         QWEN35_NUM_STAGES = _qwen35_prefill_tuning(
             "VLLM_ROCM_QWEN35_UNIFIED_NUM_STAGES", 1, (1, 2)
