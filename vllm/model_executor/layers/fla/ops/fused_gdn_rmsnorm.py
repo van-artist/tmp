@@ -17,15 +17,17 @@ def _rmsnorm_gated_strided_z_kernel(
     stride_x_head,
     stride_z_token,
     stride_z_head,
-    num_tokens,
     num_heads: tl.constexpr,
     head_size: tl.constexpr,
     eps,
     BLOCK_D: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    token = row // num_heads
-    head = row - token * num_heads
+    # Keep the scheduler's symbolic token extent as its own launch dimension.
+    # Flattening token*head into a 1-D grid turns the profiled T<=4096 range
+    # into 4096*48=196608 and is rejected by vLLM's dynamic-shape guard during
+    # EngineCore initialization.
+    token = tl.program_id(0)
+    head = tl.program_id(1)
     offs_d = tl.arange(0, BLOCK_D)
     mask_d = offs_d < head_size
 
@@ -68,7 +70,7 @@ def rmsnorm_gated_strided_z_inplace(
 
     num_tokens, num_heads, head_size = x.shape
     block_d = triton.next_power_of_2(head_size)
-    _rmsnorm_gated_strided_z_kernel[(num_tokens * num_heads,)](
+    _rmsnorm_gated_strided_z_kernel[(num_tokens, num_heads)](
         x_ptr=x,
         z_ptr=z,
         weight_ptr=weight,
@@ -76,7 +78,6 @@ def rmsnorm_gated_strided_z_inplace(
         stride_x_head=x.stride(1),
         stride_z_token=z.stride(0),
         stride_z_head=z.stride(1),
-        num_tokens=num_tokens,
         num_heads=num_heads,
         head_size=head_size,
         eps=eps,
