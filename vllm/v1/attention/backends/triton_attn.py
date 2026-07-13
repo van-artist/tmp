@@ -28,9 +28,6 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.ops.prefix_prefill import (
-    context_attention_fwd as paged_context_attention_fwd,
-)
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -506,6 +503,7 @@ class TritonAttentionImpl(AttentionImpl):
             and not self.use_alibi_sqrt
             and attn_metadata.mm_prefix_range_tensor is None
         )
+        use_gfx936_unified_continuation = False
         if use_gfx936_prefix_prefill:
             from vllm.platforms.rocm import on_gfx936
 
@@ -516,8 +514,7 @@ class TritonAttentionImpl(AttentionImpl):
             # A prompt's first scheduler chunk has no cached prefix.  The
             # dense causal prefill kernel avoids all page-table arithmetic and
             # uses a wider K/V tile, while still writing exactly the same KV
-            # entries through do_kv_cache_update() before this call.  Later
-            # chunks continue through the paged kernel below.
+            # entries through do_kv_cache_update() before this call.
             if max_seqlen_k == max_seqlen_q:
                 context_attention_fwd(
                     q=query[:num_actual_tokens],
@@ -534,44 +531,10 @@ class TritonAttentionImpl(AttentionImpl):
                 )
                 return output
 
-            # The ROCm prefix-prefill kernel expects the legacy paged-attention
-            # cache views. Reinterpret the flash-layout caches without copying:
-            # [B, T, H, D] -> K [B, H, D/x, T, x], V [B, H, D, T].
-            num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
-            x = 16 // key_cache.element_size()
-            assert head_size % x == 0
-            paged_key_cache = key_cache.view(
-                num_blocks,
-                block_size,
-                num_kv_heads,
-                head_size // x,
-                x,
-            ).permute(0, 2, 3, 1, 4)
-            paged_value_cache = value_cache.permute(0, 2, 3, 1)
-
-            paged_context_attention_fwd(
-                q=query[:num_actual_tokens],
-                k=key[:num_actual_tokens],
-                v=value[:num_actual_tokens],
-                o=output[:num_actual_tokens],
-                kv_cache_dtype=self.kv_cache_dtype,
-                k_cache=paged_key_cache,
-                v_cache=paged_value_cache,
-                b_loc=block_table,
-                b_start_loc=cu_seqlens_q,
-                b_seq_len=seqused_k,
-                max_seq_len=max_seqlen_k,
-                max_input_len=max_seqlen_q,
-                k_scale=layer._k_scale,
-                v_scale=layer._v_scale,
-                alibi_slopes=self.alibi_slopes,
-                sliding_window=self.sliding_window[0],
-                sm_scale=self.scale,
-                skip_decode=True,
-                fp8_out_scale=output_scale,
-                sinks=self.sinks,
-            )
-            return output
+            # Later chunks use the native flash-layout unified kernel below.
+            # Its exact Qwen specialization batches ten query tokens from one
+            # KV-head group per program instead of the upstream two.
+            use_gfx936_unified_continuation = True
 
         seq_threshold_3D = attn_metadata.seq_threshold_3D
         num_par_softmax_segments = attn_metadata.num_par_softmax_segments
@@ -609,6 +572,7 @@ class TritonAttentionImpl(AttentionImpl):
             sinks=self.sinks,
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,
+            gfx936_qwen35_prefill=use_gfx936_unified_continuation,
         )
 
         return output

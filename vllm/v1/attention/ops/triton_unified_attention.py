@@ -911,6 +911,7 @@ def unified_attention(
     # Optional tensor for prefix lengths (PrefixLM support)
     mm_prefix_range=None,
     use_alibi_sqrt=False,
+    gfx936_qwen35_prefill=False,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -939,9 +940,25 @@ def unified_attention(
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
 
-    BLOCK_M = (
-        16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
-    )
+    if gfx936_qwen35_prefill:
+        assert (
+            max_seqlen_q > 1
+            and block_size == 784
+            and num_query_heads == 24
+            and num_kv_heads == 4
+            and head_size == 256
+            and q.dtype == torch.bfloat16
+        )
+        # M is flattened over query-token/GQA-head rows. With GQA=6 this
+        # covers ten query tokens per program versus two for BLOCK_M=16,
+        # while keeping the proven 32-key online-softmax tile.
+        BLOCK_M = 64
+    else:
+        BLOCK_M = (
+            16
+            if num_queries_per_kv <= 16
+            else triton.next_power_of_2(num_queries_per_kv)
+        )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
     # Ideally we would launch with kernel with:
