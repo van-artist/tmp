@@ -218,6 +218,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             and self.num_heads_kv == 4
             and self.headdim == 256
             and kv_cache_spec.dtype == torch.bfloat16
+            and vllm_config.parallel_config.decode_context_parallel_size == 1
+            and vllm_config.parallel_config.prefill_context_parallel_size == 1
+            and vllm_config.speculative_config is None
         )
         if qwen35_gather_flash:
             from vllm.platforms.rocm import on_gfx936
@@ -580,6 +583,9 @@ class TritonAttentionImpl(AttentionImpl):
             and self.head_size == 256
             and key_cache.shape[1] == 784
             and self.logits_soft_cap == 0
+            and self.alibi_slopes is None
+            and self.sinks is None
+            and self.sliding_window == (-1, -1)
             and not self.use_alibi_sqrt
             and attn_metadata.mm_prefix_range_tensor is None
         )

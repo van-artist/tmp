@@ -1283,8 +1283,8 @@ class Qwen3NextAttention(nn.Module):
             q, k, gate = fused_qk_rmsnorm_rope_gate(
                 q_gate,
                 k,
-                self.q_norm.weight.float() + 1.0,
-                self.k_norm.weight.float() + 1.0,
+                self.q_norm.weight,
+                self.k_norm.weight,
                 self.rotary_emb.cos_sin_cache,
                 pos,
                 self.q_norm.variance_epsilon,

@@ -65,9 +65,13 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     )
     variance = tl.sum(x * x, axis=0) / head_dim
     inv_rms = tl.rsqrt(variance + eps)
+    # Gemma RMSNorm stores the offset from one.  Add one after the raw weight
+    # load inside this existing kernel instead of materializing two temporary
+    # FP32 tensors (and their conversion/add launches) in every attention
+    # layer on every scheduler step.
     weight = tl.load(
         weight_ptr + head_offs, mask=head_mask, other=0.0
-    ).to(tl.float32)
+    ).to(tl.float32) + 1.0
 
     # Match the unfused GemmaRMSNorm output being stored as BF16 before RoPE.
     x_norm = (x * inv_rms * weight).to(INPUT_DTYPE).to(tl.float32)
@@ -85,10 +89,10 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     ).to(tl.float32)
     w_rot1 = tl.load(
         weight_ptr + rot_offs, mask=rot_mask, other=0.0
-    ).to(tl.float32)
+    ).to(tl.float32) + 1.0
     w_rot2 = tl.load(
         weight_ptr + half_rotary + rot_offs, mask=rot_mask, other=0.0
-    ).to(tl.float32)
+    ).to(tl.float32) + 1.0
     x_rot1 = (x_rot1 * inv_rms * w_rot1).to(INPUT_DTYPE).to(tl.float32)
     x_rot2 = (x_rot2 * inv_rms * w_rot2).to(INPUT_DTYPE).to(tl.float32)
 
@@ -135,7 +139,7 @@ def fused_qk_rmsnorm_rope_gate(
     head_dim: int,
     rotary_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return contiguous post-norm/post-RoPE Q/K and the raw gate."""
+    """Return Q/K and gate using raw Gemma RMSNorm offset weights."""
     if rotary_dim <= 0 or rotary_dim > head_dim or rotary_dim % 2 != 0:
         raise ValueError(
             "rotary_dim must be a positive even integer <= head_dim, "
