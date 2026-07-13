@@ -33,6 +33,7 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fla.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
+    chunk_gated_delta_rule_into as fla_chunk_gated_delta_rule_into,
 )
 from vllm.model_executor.layers.fla.ops import (
     fused_post_conv_prep,
@@ -833,6 +834,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             # V1 profile run — warm up prefill kernels so that
             # autotuning completes before KV cache allocation.
             self._warmup_prefill_kernels(mixed_qkv)
+            core_attn_out.zero_()
             return
 
         assert isinstance(attn_metadata, dict)
@@ -867,6 +869,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
+
+        # The outer Qwen3.5 path allocates this buffer with empty(). Every
+        # real row is overwritten below; only scheduler padding must be zero.
+        if num_actual_tokens < core_attn_out.shape[0]:
+            core_attn_out[num_actual_tokens:].zero_()
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
@@ -979,7 +986,14 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             )
 
         if attn_metadata.num_prefills > 0 and not fused_prefill_prep:
-            g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+            # The six-way Qwen3.5 projection leaves b/a as strided views.
+            # Only this legacy flat-offset kernel needs materialized inputs;
+            # the exact pure-prefill and packed-decode kernels use token strides.
+            gating_a = a if a.is_contiguous() else a.contiguous()
+            gating_b = b if b.is_contiguous() else b.contiguous()
+            g, beta = fused_gdn_gating(
+                self.A_log, gating_a, gating_b, self.dt_bias
+            )
             if spec_sequence_masks is not None:
                 g_non_spec = g.index_select(1, non_spec_token_indx)
                 beta_non_spec = beta.index_select(1, non_spec_token_indx)
@@ -1017,6 +1031,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             core_attn_out_spec, last_recurrent_state = None, None
 
         # 2.2: Process the remaining part
+        direct_prefill_out = False
         if attn_metadata.num_prefills > 0:
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
             initial_state[~has_initial_state, ...] = 0
@@ -1030,20 +1045,37 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 and non_spec_query_start_loc.shape[0] == 2
                 else non_spec_query_start_loc
             )
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = self.chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=gdn_cu_seqlens,
-                use_qk_l2norm_in_kernel=not fused_prefill_prep,
-            )
+            direct_prefill_out = fused_prefill_prep and gdn_cu_seqlens is None
+            if direct_prefill_out:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    fla_chunk_gated_delta_rule_into(
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        g=g_non_spec,
+                        beta=beta_non_spec,
+                        out=core_attn_out[:num_actual_tokens].unsqueeze(0),
+                        initial_state=initial_state,
+                        output_final_state=True,
+                        cu_seqlens=None,
+                        use_qk_l2norm_in_kernel=False,
+                    )
+                )
+            else:
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = self.chunk_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=gdn_cu_seqlens,
+                    use_qk_l2norm_in_kernel=not fused_prefill_prep,
+                )
             # Init cache
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
@@ -1083,7 +1115,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
-            core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+            if not direct_prefill_out:
+                core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
     def _forward_core_decode_non_spec(
         self,
@@ -1132,6 +1165,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],
             use_qk_l2norm_in_kernel=True,
         )
+        if num_actual_tokens < core_attn_out.shape[0]:
+            core_attn_out[num_actual_tokens:].zero_()
         return
 
 

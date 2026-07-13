@@ -39,6 +39,7 @@ from vllm.distributed import (
     get_pp_group,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fla.ops import rmsnorm_gated_strided_z_inplace
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3_5RMSNorm,
 )
@@ -195,15 +196,13 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         z = z.reshape(z.size(0), -1, self.head_v_dim)
         b, a = ba.chunk(2, dim=-1)
 
-        b = b.contiguous()
-        a = a.contiguous()
-
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
-        # Note: we should not use torch.empty here like other attention backends,
-        # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        core_attn_out = torch.zeros(
+        # The core overwrites all real rows and explicitly zeros scheduler
+        # padding/profile rows, so this exact Qwen3.5 path can avoid a full
+        # allocation-sized memset in every GDN layer.
+        core_attn_out = torch.empty(
             (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
@@ -220,12 +219,11 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        z_shape_og = z.shape
-        # Reshape input data into 2D tensor
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
+        # Consume the strided z view directly and reuse the core output buffer.
+        # Flattening z would copy 48 MiB at a 4096-token prefill step.
+        core_attn_out = rmsnorm_gated_strided_z_inplace(
+            core_attn_out, z, self.norm.weight, self.norm.eps
+        )
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 

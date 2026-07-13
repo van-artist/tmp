@@ -31,6 +31,7 @@ def chunk_gated_delta_rule_fwd(
     initial_state: torch.Tensor,
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
+    out: torch.Tensor | None = None,
 ):
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     # obtain WY representation. u is actually the new v.
@@ -63,6 +64,7 @@ def chunk_gated_delta_rule_fwd(
         g=g,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        out=out,
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None
@@ -217,3 +219,44 @@ def chunk_gated_delta_rule(
         use_qk_l2norm_in_kernel,
     )
     return o, final_state
+
+
+@torch.compiler.disable
+def chunk_gated_delta_rule_into(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    out: torch.Tensor,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Inference-only GDN path that writes K6 output into ``out`` directly."""
+    if q.dtype != k.dtype or q.dtype != v.dtype or q.dtype == torch.float32:
+        raise ValueError("q, k and v must use the same non-fp32 dtype")
+    if cu_seqlens is not None:
+        raise ValueError("direct output is specialized for fixed B=1 prefill")
+    if q.shape[0] != 1 or out.shape != v.shape:
+        raise ValueError("direct output requires B=1 and out.shape == v.shape")
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    if use_qk_l2norm_in_kernel:
+        q = l2norm_fwd(q)
+        k = l2norm_fwd(k)
+    _, output, _, final_state, _, _, _ = chunk_gated_delta_rule_fwd(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=None,
+        out=out,
+    )
+    return output, final_state
