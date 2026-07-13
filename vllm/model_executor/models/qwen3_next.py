@@ -770,46 +770,52 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             )
             cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.long)
 
-            try:
-                self.chunk_gated_delta_rule(
-                    q=q,
-                    k=k,
-                    v=v,
-                    g=g,
-                    beta=beta,
-                    initial_state=state,
-                    output_final_state=False,
-                    cu_seqlens=cu_seqlens,
-                    use_qk_l2norm_in_kernel=False,
-                )
-            except Exception:
-                logger.warning(
-                    "GDN prefill kernel warmup (T=%d) failed for "
-                    "layer %s. First inference may OOM due to "
-                    "autotuner.",
-                    T,
-                    self.prefix,
-                    exc_info=True,
-                )
-            else:
-                logger.debug(
-                    "GDN prefill kernel warmup (T=%d) completed for layer %s",
-                    T,
-                    self.prefix,
-                )
-            finally:
-                del (
-                    dummy_mixed_qkv,
-                    dummy_a,
-                    dummy_b,
-                    q,
-                    k,
-                    v,
-                    g,
-                    beta,
-                    state,
-                    cu_seqlens,
-                )
+            # Warm both the general varlen route used by accuracy/mixed
+            # batches and the fixed B=1 route used by the throughput test.
+            for warmup_cu_seqlens in (cu_seqlens, None):
+                mode = "varlen" if warmup_cu_seqlens is not None else "fixed"
+                try:
+                    self.chunk_gated_delta_rule(
+                        q=q,
+                        k=k,
+                        v=v,
+                        g=g,
+                        beta=beta,
+                        initial_state=state,
+                        output_final_state=False,
+                        cu_seqlens=warmup_cu_seqlens,
+                        use_qk_l2norm_in_kernel=False,
+                    )
+                except Exception:
+                    logger.warning(
+                        "GDN %s prefill kernel warmup (T=%d) failed for "
+                        "layer %s. First inference may OOM due to "
+                        "autotuner.",
+                        mode,
+                        T,
+                        self.prefix,
+                        exc_info=True,
+                    )
+                else:
+                    logger.debug(
+                        "GDN %s prefill kernel warmup (T=%d) completed for "
+                        "layer %s",
+                        mode,
+                        T,
+                        self.prefix,
+                    )
+            del (
+                dummy_mixed_qkv,
+                dummy_a,
+                dummy_b,
+                q,
+                k,
+                v,
+                g,
+                beta,
+                state,
+                cu_seqlens,
+            )
 
         torch.accelerator.empty_cache()
 
@@ -1014,6 +1020,16 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         if attn_metadata.num_prefills > 0:
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
             initial_state[~has_initial_state, ...] = 0
+            # A single pure prefill is already represented as [B=1, T, ...].
+            # Avoid rebuilding and reading the equivalent [0, T] variable-
+            # length chunk metadata in every FLA kernel. Mixed/multi-request
+            # batches keep the general path unchanged.
+            gdn_cu_seqlens = (
+                None
+                if fused_prefill_prep
+                and non_spec_query_start_loc.shape[0] == 2
+                else non_spec_query_start_loc
+            )
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1025,7 +1041,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 beta=beta_non_spec,
                 initial_state=initial_state,
                 output_final_state=True,
-                cu_seqlens=non_spec_query_start_loc,
+                cu_seqlens=gdn_cu_seqlens,
                 use_qk_l2norm_in_kernel=not fused_prefill_prep,
             )
             # Init cache
