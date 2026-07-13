@@ -79,6 +79,14 @@ class TritonAttentionMetadata:
     prefix_scheduler_metadata: torch.Tensor | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
 
+    # Dense scratch views used only by the exact gfx936 Qwen3.5 continuation
+    # prefill path.  They are prepared once by the metadata builder and shared
+    # serially by the full-attention layers, avoiding per-layer allocations and
+    # Python slicing overhead in forward().
+    gfx936_dense_key: torch.Tensor | None = None
+    gfx936_dense_value: torch.Tensor | None = None
+    gfx936_cu_seqlens_k: torch.Tensor | None = None
+
     @property
     def mm_prefix_range_tensor(self) -> torch.Tensor | None:
         """Convert mm_prefix_range dict to padded tensor for Triton kernel.
@@ -189,10 +197,59 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             device=device,
         )
 
+        # The contest workload is one Qwen3.5 request at a time.  Its hybrid
+        # cache gives full attention a 784-token physical page, while the native
+        # gfx936 FlashAttention kernel requires a 64-aligned page.  A single
+        # builder-owned dense scratch pair lets us use the much faster dense
+        # FlashAttention kernel without changing cache allocation semantics.
+        self.gfx936_dense_kv: torch.Tensor | None = None
+        self.gfx936_dense_key: torch.Tensor | None = None
+        self.gfx936_dense_value: torch.Tensor | None = None
+        self.gfx936_cu_k_by_len: torch.Tensor | None = None
+        qwen35_gather_flash = (
+            current_platform.is_rocm()
+            and getattr(model_config, "architecture", None)
+            in (
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            )
+            and self.block_size == 784
+            and self.num_heads_q == 24
+            and self.num_heads_kv == 4
+            and self.headdim == 256
+            and kv_cache_spec.dtype == torch.bfloat16
+        )
+        if qwen35_gather_flash:
+            from vllm.platforms.rocm import on_gfx936
+
+            qwen35_gather_flash = on_gfx936()
+        if qwen35_gather_flash:
+            max_model_len = model_config.max_model_len
+            self.gfx936_dense_kv = torch.empty(
+                (2, max_model_len, 4, 256),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self.gfx936_dense_key, self.gfx936_dense_value = (
+                self.gfx936_dense_kv.unbind(0)
+            )
+            self.gfx936_cu_k_by_len = torch.zeros(
+                (max_model_len + 1, 2), dtype=torch.int32, device=device
+            )
+            self.gfx936_cu_k_by_len[:, 1] = torch.arange(
+                max_model_len + 1, dtype=torch.int32, device=device
+            )
+
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> TritonAttentionMetadata:
         attn_metadata = self.build(0, common_attn_metadata)
+        # Continuation prefill is intentionally eager.  Never retain mutable
+        # dense scratch views in metadata used for graph capture, even if a
+        # future capture shape has max_query_len > 1.
+        attn_metadata.gfx936_dense_key = None
+        attn_metadata.gfx936_dense_value = None
+        attn_metadata.gfx936_cu_seqlens_k = None
         # When doing full graph capture, setting seq_lens to
         # max_model_len will cause graph capture to be extremely
         # slow, so here we set it to 1.
@@ -231,6 +288,26 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             suffix_kv_lens = None
             prefix_scheduler_metadata = None
 
+        gfx936_dense_key = None
+        gfx936_dense_value = None
+        gfx936_cu_seqlens_k = None
+        if (
+            self.gfx936_dense_key is not None
+            and max_query_len > 1
+            and max_seq_len > max_query_len
+            and num_actual_tokens == max_query_len
+            and common_attn_metadata.num_reqs == 1
+            and query_start_loc.shape[0] == 2
+            and block_table_tensor.shape[0] == 1
+            and not use_cascade
+        ):
+            # Construct views once per scheduler step, not once per attention
+            # layer.  The model executes these layers serially on one stream.
+            gfx936_dense_key = self.gfx936_dense_key[:max_seq_len]
+            gfx936_dense_value = self.gfx936_dense_value[:max_seq_len]
+            assert self.gfx936_cu_k_by_len is not None
+            gfx936_cu_seqlens_k = self.gfx936_cu_k_by_len[max_seq_len]
+
         attn_metadata = TritonAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -250,6 +327,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_output=self.softmax_segm_output,
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
+            gfx936_dense_key=gfx936_dense_key,
+            gfx936_dense_value=gfx936_dense_value,
+            gfx936_cu_seqlens_k=gfx936_cu_seqlens_k,
         )
         return attn_metadata
 
@@ -516,24 +596,67 @@ class TritonAttentionImpl(AttentionImpl):
             # uses a wider K/V tile, while still writing exactly the same KV
             # entries through do_kv_cache_update() before this call.
             if max_seqlen_k == max_seqlen_q:
-                context_attention_fwd(
-                    q=query[:num_actual_tokens],
-                    k=key[:num_actual_tokens],
-                    v=value[:num_actual_tokens],
-                    o=output[:num_actual_tokens],
-                    b_start_loc=cu_seqlens_q,
-                    b_seq_len=seqused_k,
-                    max_input_len=max_seqlen_q,
-                    is_causal=True,
+                from flash_attn import vllm_flash_attn_varlen_func
+
+                vllm_flash_attn_varlen_func(
+                    query[:num_actual_tokens],
+                    key[:num_actual_tokens],
+                    value[:num_actual_tokens],
+                    max_seqlen_q,
+                    cu_seqlens_q,
+                    max_seqlen_k,
+                    cu_seqlens_k=cu_seqlens_q,
+                    dropout_p=0.0,
                     softmax_scale=self.scale,
-                    sliding_window_q=self.sliding_window[0],
-                    sliding_window_k=self.sliding_window[1],
+                    causal=True,
+                    window_size=list(self.sliding_window),
+                    out=output[:num_actual_tokens],
+                    is_prefix_cache=False,
+                    fa_version=2,
                 )
                 return output
 
-            # Later chunks use the native flash-layout unified kernel below.
-            # Its exact Qwen specialization batches ten query tokens from one
-            # KV-head group per program instead of the upstream two.
+            dense_key = attn_metadata.gfx936_dense_key
+            dense_value = attn_metadata.gfx936_dense_value
+            cu_seqlens_k = attn_metadata.gfx936_cu_seqlens_k
+            if (
+                dense_key is not None
+                and dense_value is not None
+                and cu_seqlens_k is not None
+            ):
+                from flash_attn import vllm_flash_attn_varlen_func
+
+                from vllm.v1.attention.ops.triton_qwen35_kv_gather import (
+                    gather_qwen35_paged_kv,
+                )
+
+                gather_qwen35_paged_kv(
+                    key_cache,
+                    value_cache,
+                    dense_key,
+                    dense_value,
+                    block_table,
+                    max_seqlen_k,
+                )
+                vllm_flash_attn_varlen_func(
+                    query[:num_actual_tokens],
+                    dense_key,
+                    dense_value,
+                    max_seqlen_q,
+                    cu_seqlens_q,
+                    max_seqlen_k,
+                    cu_seqlens_k=cu_seqlens_k,
+                    dropout_p=0.0,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    window_size=list(self.sliding_window),
+                    out=output[:num_actual_tokens],
+                    is_prefix_cache=False,
+                    fa_version=2,
+                )
+                return output
+
+            # Defensive fallback for profiling/capture or non-standard batches.
             use_gfx936_unified_continuation = True
 
         seq_threshold_3D = attn_metadata.seq_threshold_3D
