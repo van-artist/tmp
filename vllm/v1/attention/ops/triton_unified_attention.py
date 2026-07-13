@@ -234,22 +234,52 @@ def kernel_unified_attention_2d(
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
 
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
+        if BLOCK_SIZE == 784 and TILE_SIZE == 32:
+            tile_token_start = j * TILE_SIZE
+            page_idx = tile_token_start // BLOCK_SIZE
+            page_offset = tile_token_start - page_idx * BLOCK_SIZE
+            crosses_page = offs_t >= BLOCK_SIZE - page_offset
+            internal_offset = (
+                page_offset
+                + offs_t
+                - crosses_page.to(tl.int32) * BLOCK_SIZE
+            )
+            block_table_ptr = (
+                block_tables_ptr + block_table_offset + page_idx
+            )
+            first_page = tl.load(block_table_ptr).to(tl.int64)
+            next_page_is_used = (
+                (page_offset + TILE_SIZE > BLOCK_SIZE)
+                & (max_seq_prefix_len > tile_token_start + BLOCK_SIZE - page_offset)
+            )
+            next_page = tl.load(
+                block_table_ptr + 1,
+                mask=next_page_is_used,
+                other=0,
+            ).to(tl.int64)
+            physical_block_idx = tl.where(
+                crosses_page, next_page, first_page
+            )
+        else:
+            physical_block_idx = tl.load(
+                block_tables_ptr
+                + block_table_offset
+                + seq_offset // BLOCK_SIZE
+            ).to(tl.int64)
+            internal_offset = seq_offset % BLOCK_SIZE
 
         v_offset = (
             physical_block_idx[:, None] * stride_v_cache_0
             + kv_head_idx * stride_v_cache_2
             + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            + internal_offset[:, None] * stride_v_cache_1
         )
 
         k_offset = (
             physical_block_idx[None, :] * stride_k_cache_0
             + kv_head_idx * stride_k_cache_2
             + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            + internal_offset[None, :] * stride_k_cache_1
         )
 
         # K : (HEAD_SIZE, TILE_SIZE)
