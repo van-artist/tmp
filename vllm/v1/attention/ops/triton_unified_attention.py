@@ -7,6 +7,8 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+import os
+
 import torch
 
 from vllm.logger import init_logger
@@ -17,6 +19,19 @@ from vllm.triton_utils import tl, triton
 logger = init_logger(__name__)
 is_batch_invariant = vllm_is_batch_invariant()
 float8_info = torch.finfo(current_platform.fp8_dtype())
+
+
+def _qwen35_prefill_tuning(name: str, default: int, allowed: tuple[int, ...]) -> int:
+    """Read a guarded exact-shape ROCm tuning override.
+
+    These knobs are deliberately private to the Qwen3.5 gfx936 specialization;
+    invalid values fall back to the numerically validated default.
+    """
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if value in allowed else default
 
 
 @triton.jit
@@ -141,7 +156,11 @@ def kernel_unified_attention_2d(
     )
 
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
-    query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
+    # BLOCK_M is flattened over query-token/GQA-head rows. For non-power-of-two
+    # GQA ratios (Qwen3.5 uses 6), a power-of-two BLOCK_M otherwise spills into
+    # the next query token and races the following program. Mask those tail rows.
+    valid_m = offs_m < BLOCK_Q * num_queries_per_kv
+    query_mask_0 = ((query_pos < cur_batch_query_len) & valid_m).to(tl.int1)
     query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
@@ -185,12 +204,7 @@ def kernel_unified_attention_2d(
 
     # compute the length of the longest sequence prefix spanned by any
     # query token in the current q_block (q_block_local_idx)
-    max_seq_prefix_len = (
-        context_len
-        + q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // num_queries_per_kv
-        + 1
-    )
+    max_seq_prefix_len = context_len + (q_block_local_idx + 1) * BLOCK_Q
 
     if USE_MM_PREFIX:
         # image bidirectional attention ranges require a full range
@@ -214,10 +228,7 @@ def kernel_unified_attention_2d(
     if SLIDING_WINDOW > 0 and not USE_MM_PREFIX:
         # Query rows covered by this Q-block
         qpos_lo = q_block_local_idx * BLOCK_Q
-        qpos_hi = tl.minimum(
-            qpos_lo + (BLOCK_M - 1) // num_queries_per_kv,
-            cur_batch_query_len - 1,
-        )
+        qpos_hi = tl.minimum(qpos_lo + BLOCK_Q - 1, cur_batch_query_len - 1)
         # For sliding window, each query position q can only attend to
         # keys in the range [q_abs - SLIDING_WINDOW + 1, q_abs]
         # where q_abs = context_len + q
@@ -234,7 +245,7 @@ def kernel_unified_attention_2d(
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
 
-        if BLOCK_SIZE == 784 and TILE_SIZE == 32:
+        if BLOCK_SIZE == 784 and (TILE_SIZE == 32 or TILE_SIZE == 64):
             tile_token_start = j * TILE_SIZE
             page_idx = tile_token_start // BLOCK_SIZE
             page_offset = tile_token_start - page_idx * BLOCK_SIZE
@@ -979,10 +990,24 @@ def unified_attention(
             and head_size == 256
             and q.dtype == torch.bfloat16
         )
-        # M is flattened over query-token/GQA-head rows. With GQA=6 this
-        # covers ten query tokens per program versus two for BLOCK_M=16,
-        # while keeping the proven 32-key online-softmax tile.
-        BLOCK_M = 64
+        # M is flattened over query-token/GQA-head rows. The guarded knobs let
+        # the exact evaluator shape select between the two useful occupancy
+        # points without exposing arbitrary compile configurations.
+        BLOCK_M = _qwen35_prefill_tuning(
+            "VLLM_ROCM_QWEN35_UNIFIED_BLOCK_M", 64, (64, 128)
+        )
+        QWEN35_TILE_SIZE = _qwen35_prefill_tuning(
+            "VLLM_ROCM_QWEN35_UNIFIED_TILE_SIZE", 32, (32, 64)
+        )
+        QWEN35_NUM_WARPS = _qwen35_prefill_tuning(
+            "VLLM_ROCM_QWEN35_UNIFIED_NUM_WARPS", 4, (4, 8)
+        )
+        QWEN35_NUM_STAGES = _qwen35_prefill_tuning(
+            "VLLM_ROCM_QWEN35_UNIFIED_NUM_STAGES", 1, (1, 2)
+        )
+        QWEN35_WAVES_PER_EU = _qwen35_prefill_tuning(
+            "VLLM_ROCM_QWEN35_UNIFIED_WAVES_PER_EU", 2, (1, 2, 4)
+        )
     else:
         BLOCK_M = (
             16
@@ -1017,6 +1042,15 @@ def unified_attention(
         q.element_size(),
         is_prefill=False,
     )
+    if gfx936_qwen35_prefill:
+        TILE_SIZE_PREFILL = QWEN35_TILE_SIZE
+        qwen35_launch_config = {
+            "num_warps": QWEN35_NUM_WARPS,
+            "num_stages": QWEN35_NUM_STAGES,
+            "waves_per_eu": QWEN35_WAVES_PER_EU,
+        }
+    else:
+        qwen35_launch_config = {}
 
     # Launch the 2D kernel if
     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
@@ -1087,6 +1121,7 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
+            **qwen35_launch_config,
         )
     else:
         kernel_unified_attention_3d[
