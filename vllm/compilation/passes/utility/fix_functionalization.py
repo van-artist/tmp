@@ -112,6 +112,17 @@ class FixFunctionalizationPass(VllmInductorPass):
                 mutated_args = {1: "result"}
                 self.defunctionalize(graph, node, mutated_args)
             elif (
+                hasattr(torch.ops.vllm, "qwen35_bf16_linear_out")
+                and at_target
+                == torch.ops.vllm.qwen35_bf16_linear_out.default
+            ):
+                # This exact TP1 projection consumes a buffer allocated before
+                # the attention partition. Keep the real mm.out mutation;
+                # auto-functionalization would otherwise recreate a temporary
+                # GEMM result followed by a full-tensor copy into ``dst``.
+                mutated_args = {1: "dst"}
+                self.defunctionalize(graph, node, mutated_args)
+            elif (
                 hasattr(torch.ops.vllm, "flashinfer_trtllm_fused_allreduce_norm")
                 and at_target
                 == torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm.default

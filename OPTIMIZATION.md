@@ -4,79 +4,110 @@
 
 Target: Qwen3.5-27B BF16, one gfx936 DCU, tensor parallel size 1 and
 concurrency 1. The official scheduler, `max_num_batched_tokens=4096`,
-`max_num_seqs=128`, model weights, layer count, dense attention semantics and
-sampling workload are unchanged. No speculative decoding, pruning, sparse or
-approximate attention, skipped work, retained low-precision weight copy, or
-checkpoint conversion is used.
+`max_num_seqs=128`, 784-token physical KV page, model weights, layer count,
+attention semantics and sampling workload are unchanged. No speculative
+decoding, pruning, sparse or approximate attention, skipped work, retained
+low-precision weight copy, checkpoint conversion or persistent weight
+quantization is used.
+
+Every contest-specific route has exact model, platform, dtype, shape and phase
+guards. Unsupported shapes and environments retain the upstream path.
 
 ## Retained optimizations
 
-1. **Exact-shape gfx936 BF16 GEMV dispatch.** Three M=1 projections use
-   AITER's `gemm_a16w16` Triton kernel with measured static configurations:
-   `(34816,5120)` gate/up, `(16384,5120)` GDN QKVZ, and `(14336,5120)` full
-   attention QKV. Dispatch requires gfx936, BF16, M=1, no bias, equal
-   dtype/device and contiguous tensors. Missing AITER APIs and every other
-   shape fall back to `torch.nn.functional.linear`. Weights stay BF16 in their
-   original layout.
-2. **Phase-specific dense attention.** TRITON_ATTN remains the decode backend.
-   Only single-request Qwen3.5 BF16 decoder prefill (`max_seqlen_q > 1`) on
-   gfx936 calls vLLM's dense ROCm prefix-prefill kernel through zero-copy K/V
-   cache views. The route additionally requires Hq/Hkv/D=24/4/256, page 784,
-   no softcap/MM prefix/quantized output, and BF16 K/V. Mixed batches,
-   cross-attention and every other geometry fall back to upstream unified
-   attention. K/V storage and page geometry are unchanged.
-3. **gfx936 Qwen3.5 prefix tile.** For BF16, head dimension 256 and physical
-   page 784 only, query tile M changes from 32 to 64. Key tile, logical cache
-   traversal tile and physical page remain 32/32/784. This halves query-side
-   programs without changing any attention element or causal mask. Four warps
-   is retained; 8 warps and M=128 were measured and rejected.
+1. **Exact-shape gfx936 BF16 GEMV dispatch.** Selected measured M=1
+   projections, including gate/up and full-attention QKV, use static AITER
+   `gemm_a16w16` configurations. Dispatch requires gfx936, BF16, TP1, no bias,
+   equal dtype/device and contiguous tensors. The packed 16480-wide GDN
+   projection deliberately remains one hipBLAS GEMM because every measured
+   split/AITER variant was slower. Weights remain BF16 in their original
+   layout.
+2. **Exact 784-page gather plus dense ROCm FlashAttention.** The normal decode
+   path remains paged `TRITON_ATTN`. For a single Qwen3.5 BF16 prefill request,
+   a page-major Triton kernel gathers the exact interleaved
+   `[block, 2, 784, 4, 256]` K/V values into one builder-owned dense scratch
+   buffer, followed by the fixed environment's variable-length ROCm
+   FlashAttention. The scratch is 128 MiB at the 32K limit, shared by all full
+   attention layers and used only during the synchronous prefill call. It is
+   neither a persistent KV representation nor one allocation per layer.
+   Decode, mixed batches, capture, cascade, cross-attention, sliding-window,
+   ALiBi, sinks and every other geometry fall back unchanged.
+3. **Qwen3.5 GDN prefill fusion.** Projection splitting, convolution input
+   preparation, recurrent-state packing, gated RMSNorm and post-convolution
+   work are specialized for the official single-request 4096-token chunks.
+   The recurrent calculation and state update are exact; scheduler padding
+   rows are explicitly cleared. A strided `z` view is consumed directly to
+   avoid materializing a roughly 48 MiB contiguous copy per GDN layer and
+   chunk.
+4. **Fused full-attention preparation.** Q gate, per-head Gemma RMSNorm,
+   partial NeoX RoPE and K normalization are performed in a guarded Triton
+   kernel. Gemma norm parameters are loaded in FP32 and incremented inside the
+   kernel, which is numerically equivalent to constructing temporary
+   `weight.float() + 1` tensors but removes those launches and allocations.
+5. **Direct output projection into the layer buffer.** Both GDN and full
+   attention normally materialize a `[tokens, 5120]` GEMM result and then copy
+   it into a caller-owned buffer. An exact mutable custom op writes the
+   unquantized TP1 BF16 `[tokens,6144] @ [6144,5120]` result directly into that
+   buffer. The compilation pass explicitly defunctionalizes this op so AOT
+   functionalization cannot recreate the temporary and copy. Quantization,
+   bias, LoRA/batch-invariant execution, other shapes and other models retain
+   the original `RowParallelLinear` path.
+6. **Measured unified-attention fallback tuning.** The original paged Triton
+   implementation remains the fallback and uses the measured gfx936 Qwen3.5
+   M=64 query geometry only for its exact guarded shape. Logical and physical
+   KV traversal and the 784-token page remain unchanged.
 
-## Measured screening results
+## Validation and screening evidence
 
-All numbers below use the official script, two warmups, the same first five
-prompts and the same gfx936 software stack. They are screening results rather
-than claimed hidden-set scores.
+The last public evaluation of the parent
+`pra26-unified-adaptive-gdn-memory` was AC with no SLA or accuracy deduction:
+19.24 / 17.04 / 13.29 tok/s for 4-8K / 8-16K / 16-32K.
 
-| Candidate | 4-8K tok/s | 8-16K tok/s | 16-32K tok/s | mean TPOT | mean long TTFT |
-|---|---:|---:|---:|---:|---:|
-| Official BF16 baseline | 8.83 | 7.14 | 3.61 | 68.7-71.4 ms | 26.63 s |
-| Hybrid prefill, 32x32 | 9.91 | - | 4.21 | unchanged | 22.47 s |
-| AITER3 + hybrid 32x32 | 12.17 | 9.06 | 4.57 | 49.75-52.48 ms | 22.45 s |
-| AITER3 + hybrid 64x32 | 13.01 | - | 6.12 | 49.50-52.57 ms | 14.91 s |
+The dense-attention candidate was screened with the official serving command,
+two warmups, concurrency 1 and the same first five prompts. All 15 requests
+completed with no errors. Paired mean TTFT changed as follows:
 
-Microbenchmarks for the retained M=1 routes:
-
-| Projection | torch BF16 | tuned AITER | speedup |
+| Bucket | Parent TTFT | Candidate TTFT | Reduction |
 |---|---:|---:|---:|
-| gate/up 34816x5120 | 0.501 ms | 0.311 ms | 1.61x |
-| GDN QKVZ 16384x5120 | 0.241 ms | 0.151 ms | 1.60x |
-| full QKV 14336x5120 | 0.237 ms | 0.134 ms | 1.77x |
+| 4-8K | 1.540 s | 1.481 s | 3.8% |
+| 8-16K | 3.627 s | 3.166 s | 12.7% |
+| 16-32K | 6.385 s | 5.224 s | 18.2% |
 
-Each microbenchmark was finite and deterministic; the close fraction against
-PyTorch was 100% at `rtol=0.02, atol=0.01`. End-to-end screening completed all
-requests with empty error fields. The 64x32 tile preserved the 32x32 generated
-texts on the compared long prompts. Its clean short-bucket run generated the
-same 386 tokens as baseline across the first five prompts, with 5/5 successful
-requests and zero failures. Full public accuracy remains the final release gate
-because GEMM reduction order is not bit-identical.
+On exact synthetic tensors, the 784-page gather reproduced K/V with zero
+maximum absolute error. Gather plus dense FlashAttention took approximately
+4.48 / 10.01 / 22.29 ms at 8K / 16K / 32K, versus 12.67 / 28.68 / 60.73 ms
+for the retained paged Triton kernel. Attention output differences caused by
+the changed BF16 reduction order were at most 0.001953 / 0.000976 / 0.000488
+for continuation chunks. These are screening results, not a claimed hidden-set
+score.
 
 ## Rejected experiments
 
-- Batch-1 static compilation (`compile_sizes=[1]`): engine initialization
-  failed after compiling the singleton and dynamic ranges. The proven default
-  FULL_AND_PIECEWISE graph configuration is retained.
-- gfx936 `wvSplitK`: compiled only after replacing an unsupported dot
-  instruction, but failed numerical validation (91.4% outside tolerance).
-- Full ROCM_ATTN: prefill improved but decode TPOT regressed to 117-173 ms.
-- Prefix tiles 64x64 and 128x32: slower and/or changed generations.
-- 64x32 with 8 warps: first long TTFT 19.29 s versus 13.87 s with 4 warps.
-- Global hipBLASLt preference: large GDN/full-QKV GEMMs regressed 39.6%/24.7%.
-- AITER for down/out/BA/lm_head: slower; lm_head also failed the numerical gate.
+- Changing the physical KV page: rejected because page geometry is a locked
+  contest invariant. The formal branch remains at 784.
+- Splitting the 16480-wide GDN decode projection into separate matrices: all
+  measured AITER/PyTorch combinations were slower than the fused hipBLAS GEMM.
+- Alternate packed recurrent decode tiles: the best microbenchmark saved only
+  about 4% inside a roughly 0.10 ms kernel and introduced small recurrent-state
+  differences, so it was not retained.
+- GDN `opt_vk`: slower at 4096 tokens and changed recurrent state/output.
+- Batch-1-only compilation: engine initialization failed outside the singleton
+  range. The proven dynamic plus piecewise graph configuration is retained.
+- gfx936 `wvSplitK`: failed numerical validation.
+- Full `ROCM_ATTN`: improved prefill but substantially regressed decode TPOT.
+- Larger unified-attention tiles and eight-warps variants: slower in measured
+  long-context runs and/or changed generations.
+- Global hipBLASLt preference and AITER for down/out/BA/lm_head: measured
+  regressions; lm_head also failed the numerical gate.
 
 ## Source locations
 
-- `vllm/model_executor/layers/utils.py`: exact GEMV configs and dispatch.
+- `vllm/model_executor/layers/utils.py`: exact GEMV dispatch.
+- `vllm/model_executor/layers/fla/ops/`: guarded GDN fusion and recurrent ops.
+- `vllm/model_executor/layers/fused_qk_norm_rope.py`: Q/K norm, gate and RoPE.
+- `vllm/model_executor/models/qwen3_5.py` and `qwen3_next.py`: model routing.
+- `vllm/v1/attention/backends/triton_attn.py`: phase-specific attention route
+  and builder-owned dense scratch.
+- `vllm/v1/attention/ops/triton_qwen35_kv_gather.py`: exact paged K/V gather.
+- `vllm/v1/attention/ops/triton_unified_attention.py`: guarded fallback tile.
 - `vllm/platforms/rocm.py`: isolated gfx936 predicate.
-- `vllm/v1/attention/backends/triton_attn.py`: prefill/decode dense dispatch.
-- `vllm/v1/attention/ops/prefix_prefill.py`: exact geometry tile selection.
-- `vllm/envs.py`: documented, validated opt-out/tuning variables.

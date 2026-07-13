@@ -317,6 +317,31 @@ direct_register_custom_op(
 )
 
 
+def qwen35_bf16_linear_out_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    dst: torch.Tensor,
+) -> None:
+    """Write an unquantized Qwen3.5 projection into its caller-owned buffer."""
+    torch.mm(x, weight.t(), out=dst)
+
+
+def qwen35_bf16_linear_out_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    dst: torch.Tensor,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="qwen35_bf16_linear_out",
+    op_func=qwen35_bf16_linear_out_impl,
+    mutates_args=["dst"],
+    fake_impl=qwen35_bf16_linear_out_fake,
+)
+
+
 def check_cpu_sgl_kernel(n: int, k: int, dtype: torch.dtype) -> bool:
     return (
         torch._C._cpu._is_amx_tile_supported()

@@ -31,6 +31,7 @@ from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.model_executor.layers.fla.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
     chunk_gated_delta_rule_into as fla_chunk_gated_delta_rule_into,
@@ -55,6 +56,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -111,6 +113,49 @@ from .utils import (
 logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
+
+
+def _can_use_qwen35_bf16_linear_out(
+    config: Qwen3NextConfig,
+    projection: RowParallelLinear,
+    x: torch.Tensor,
+    dst: torch.Tensor,
+) -> bool:
+    """Guard the contest-only TP1 Qwen3.5 output-projection fast path."""
+    if (
+        getattr(config, "model_type", None) != "qwen3_5_text"
+        or not current_platform.is_rocm()
+    ):
+        return False
+
+    from vllm.platforms.rocm import on_gfx936
+
+    return (
+        on_gfx936()
+        and projection.tp_size == 1
+        and projection.input_is_parallel
+        and projection.reduce_results
+        and isinstance(projection.quant_method, UnquantizedLinearMethod)
+        and projection.bias is None
+        and not vllm_is_batch_invariant()
+        and not torch.is_grad_enabled()
+        and x.ndim == 2
+        and dst.ndim == 2
+        and x.shape[1] == 6144
+        and projection.weight.shape == (5120, 6144)
+        and dst.shape == (x.shape[0], 5120)
+        and x.dtype == torch.bfloat16
+        and projection.weight.dtype == torch.bfloat16
+        and dst.dtype == torch.bfloat16
+        and x.is_cuda
+        and projection.weight.is_cuda
+        and dst.is_cuda
+        and x.device == projection.weight.device
+        and x.device == dst.device
+        and x.is_contiguous()
+        and projection.weight.is_contiguous()
+        and dst.is_contiguous()
+    )
 
 
 def fi_chunk_gated_delta_rule(
@@ -1334,7 +1379,14 @@ class Qwen3NextAttention(nn.Module):
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
 
-        output[:], _ = self.o_proj(attn_output)
+        if _can_use_qwen35_bf16_linear_out(
+            self.config, self.o_proj, attn_output, output
+        ):
+            torch.ops.vllm.qwen35_bf16_linear_out(
+                attn_output, self.o_proj.weight, output
+            )
+        else:
+            output[:], _ = self.o_proj(attn_output)
 
 
 class Qwen3NextDecoderLayer(nn.Module):

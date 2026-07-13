@@ -89,6 +89,7 @@ from .qwen3_next import (
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
+    _can_use_qwen35_bf16_linear_out,
 )
 from .qwen3_vl import (
     Qwen3_VisionTransformer,
@@ -225,7 +226,14 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             core_attn_out, z, self.norm.weight, self.norm.eps
         )
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
-        output[:num_tokens], _ = self.out_proj(core_attn_out)
+        if _can_use_qwen35_bf16_linear_out(
+            self.config, self.out_proj, core_attn_out, output
+        ):
+            torch.ops.vllm.qwen35_bf16_linear_out(
+                core_attn_out, self.out_proj.weight, output
+            )
+        else:
+            output[:num_tokens], _ = self.out_proj(core_attn_out)
 
 
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
