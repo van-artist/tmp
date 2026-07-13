@@ -289,6 +289,14 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
+            # A post-load optimization in UnquantizedLinearMethod uses this
+            # explicit marker instead of guessing from a common module class or
+            # weight shape.  Its own strict gfx936/model/shape guards still
+            # decide whether any conversion is performed.
+            gate_up_proj = self.mlp.gate_up_proj
+            gate_up_proj._qwen35_dense_gateup_candidate = True
+            gate_up_proj._qwen35_layer_idx = self.layer_idx
+            gate_up_proj._qwen35_num_hidden_layers = config.num_hidden_layers
         else:
             raise ValueError(f"Invalid model_type {config.model_type}")
 

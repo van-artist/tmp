@@ -25,6 +25,10 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.qwen35_gateup_int8 import (
+    apply_qwen35_gateup_int8,
+    maybe_process_qwen35_gateup_int8,
+)
 from vllm.model_executor.layers.utils import (
     dispatch_unquantized_gemm,
 )
@@ -212,6 +216,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if current_platform.is_rocm():
+            if maybe_process_qwen35_gateup_int8(layer):
+                return
         if current_platform.is_cpu():
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
@@ -223,6 +230,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, "_qwen35_gateup_int8_enabled", False):
+            return apply_qwen35_gateup_int8(layer, x, bias)
         if vllm_is_batch_invariant() and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)

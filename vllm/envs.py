@@ -113,6 +113,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_GFX936_AITER_GEMV: bool = True
+    VLLM_ROCM_QWEN35_GATEUP_INT8_LAYERS: str = "32"
     VLLM_ROCM_PREFIX_PREFILL_TILE_M: int = 64
     VLLM_ROCM_PREFIX_PREFILL_TILE_N: int = 32
     VLLM_ROCM_PREFIX_PREFILL_NUM_WARPS: int = 4
@@ -988,6 +989,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ROCM_USE_GFX936_AITER_GEMV", "True").lower()
         in ("true", "1")
     ),
+    # Runtime W8A8 gate/up projection specialized for the 64-layer dense
+    # Qwen3.5-27B contest model on gfx936.  Accepted values: 0, 32/middle32,
+    # even32, last32, and 64/all.  The conservative branch defaults to the
+    # middle 32 layers; set 0 to recover the exact BF16 path without editing.
+    "VLLM_ROCM_QWEN35_GATEUP_INT8_LAYERS": lambda: os.getenv(
+        "VLLM_ROCM_QWEN35_GATEUP_INT8_LAYERS", "32"
+    ).lower(),
     # Query/key tiles for the dense ROCm prefix-prefill kernel. These do not
     # change the physical or logical KV-cache page size.
     "VLLM_ROCM_PREFIX_PREFILL_TILE_M": lambda: int(
