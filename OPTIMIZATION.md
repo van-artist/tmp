@@ -59,6 +59,12 @@ guards. Unsupported shapes and environments retain the upstream path.
    implementation remains the fallback and uses the measured gfx936 Qwen3.5
    M=64 query geometry only for its exact guarded shape. Logical and physical
    KV traversal and the 784-token page remain unchanged.
+7. **Scalar page lookup for decode tiles.** Decode uses a 16-token K/V tile,
+   and the fixed 784-token physical page is exactly 49 such tiles. Therefore a
+   tile cannot cross a page boundary: the 3-D paged kernel loads one physical
+   block index per tile and derives the 16 in-page offsets arithmetically,
+   instead of repeating division, remainder and page-table loads in every
+   lane. K/V addresses and the FP32 softmax reduction order are unchanged.
 
 ## Validation and screening evidence
 

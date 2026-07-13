@@ -630,23 +630,49 @@ def kernel_unified_attention_3d(
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
 
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
+        if BLOCK_SIZE == 784 and TILE_SIZE == 16:
+            # Qwen3.5 uses 784-token pages.  Since 784 == 49 * 16, a
+            # 16-token decode tile can never cross a page boundary.  Load the
+            # page-table entry once for the whole tile instead of once per
+            # lane, and derive each lane's in-page offset from the tile start.
+            tile_seq_offset = j * TILE_SIZE
+            page_idx = tile_seq_offset // BLOCK_SIZE
+            in_page_offset = tile_seq_offset - page_idx * BLOCK_SIZE + offs_t
+            physical_block_idx = tl.load(
+                block_tables_ptr + block_table_offset + page_idx
+            ).to(tl.int64)
 
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
+            v_offset = (
+                physical_block_idx * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + in_page_offset[:, None] * stride_v_cache_1
+            )
 
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
+            k_offset = (
+                physical_block_idx * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + in_page_offset[None, :] * stride_k_cache_1
+            )
+        else:
+            physical_block_idx = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            ).to(tl.int64)
+
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
+
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
 
         # K : (HEAD_SIZE, TILE_SIZE)
         K_load = tl.load(
