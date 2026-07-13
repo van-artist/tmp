@@ -990,28 +990,30 @@ def unified_attention(
             and head_size == 256
             and q.dtype == torch.bfloat16
         )
-        # M is flattened over query-token/GQA-head rows. The guarded knobs let
-        # the exact evaluator shape select between the two useful occupancy
-        # points without exposing arbitrary compile configurations.
-        large_qwen35_prefill = max_seqlen_q >= 256
+        # M is flattened over query-token/GQA-head rows. gfx936 measurements on
+        # the exact 24q/4kv/256d evaluator shape consistently favor M64/N32
+        # with four warps at every tested query length (16..4096). In
+        # particular, M128/N64 spills heavily and is over 2x slower on long
+        # contexts. Keep the guarded knobs for reproducible tuning, but use the
+        # measured winner as the production default for every continuation.
         BLOCK_M = _qwen35_prefill_tuning(
             "VLLM_ROCM_QWEN35_UNIFIED_BLOCK_M",
-            128 if large_qwen35_prefill else 16,
+            64,
             (16, 64, 128),
         )
         QWEN35_TILE_SIZE = _qwen35_prefill_tuning(
-            "VLLM_ROCM_QWEN35_UNIFIED_TILE_SIZE", 64, (32, 64)
+            "VLLM_ROCM_QWEN35_UNIFIED_TILE_SIZE", 32, (32, 64)
         )
         QWEN35_NUM_WARPS = _qwen35_prefill_tuning(
             "VLLM_ROCM_QWEN35_UNIFIED_NUM_WARPS",
-            4 if large_qwen35_prefill else 2,
+            4,
             (2, 4, 8),
         )
         QWEN35_NUM_STAGES = _qwen35_prefill_tuning(
             "VLLM_ROCM_QWEN35_UNIFIED_NUM_STAGES", 1, (1, 2)
         )
         QWEN35_WAVES_PER_EU = _qwen35_prefill_tuning(
-            "VLLM_ROCM_QWEN35_UNIFIED_WAVES_PER_EU", 2, (1, 2, 4)
+            "VLLM_ROCM_QWEN35_UNIFIED_WAVES_PER_EU", 1, (1, 2, 4)
         )
     else:
         BLOCK_M = (
