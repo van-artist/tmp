@@ -65,6 +65,14 @@ guards. Unsupported shapes and environments retain the upstream path.
    block index per tile and derives the 16 in-page offsets arithmetically,
    instead of repeating division, remainder and page-table loads in every
    lane. K/V addresses and the FP32 softmax reduction order are unchanged.
+8. **Length-specialized decode softmax.** Single-request decode uses 128
+   independent segments through 24K and 64 beyond that point, with a measured
+   two-warp, one-stage gfx936 launch. A graph-stable 128-segment allocation is
+   shared by both paths; the long path reads and writes only its first half.
+   This avoids the generic kernel's occupancy cliff while keeping all segment
+   statistics and the final reduction in FP32. It is an explicitly
+   higher-throughput candidate because segment partitioning changes
+   floating-point reduction grouping.
 
 ## Validation and screening evidence
 
