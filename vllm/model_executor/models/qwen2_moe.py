@@ -50,6 +50,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.qwen35_gateup_silu import (
+    qwen35_bf16_gateup_silu,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -106,8 +109,11 @@ class Qwen2MoeMLP(nn.Module):
         self.expert_gate = expert_gate
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        out = self.act_fn(gate_up)
+        if getattr(self.gate_up_proj, "_qwen35_bf16_fused_silu", False):
+            out = qwen35_bf16_gateup_silu(x, self.gate_up_proj.weight)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            out = self.act_fn(gate_up)
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:

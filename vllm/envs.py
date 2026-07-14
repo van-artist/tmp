@@ -113,6 +113,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_GFX936_AITER_GEMV: bool = True
+    VLLM_ROCM_QWEN35_FUSED_GATEUP_SILU: bool = True
     VLLM_ROCM_PREFIX_PREFILL_TILE_M: int = 64
     VLLM_ROCM_PREFIX_PREFILL_TILE_N: int = 32
     VLLM_ROCM_PREFIX_PREFILL_NUM_WARPS: int = 4
@@ -988,6 +989,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ROCM_USE_GFX936_AITER_GEMV", "True").lower()
         in ("true", "1")
     ),
+    # Fuse the exact Qwen3.5 BF16 M=1 gate/up GEMV with SiluAndMul.
+    "VLLM_ROCM_QWEN35_FUSED_GATEUP_SILU": lambda: (
+        os.getenv("VLLM_ROCM_QWEN35_FUSED_GATEUP_SILU", "True").lower()
+        in ("true", "1")
+    ),
     # Query/key tiles for the dense ROCm prefix-prefill kernel. These do not
     # change the physical or logical KV-cache page size.
     "VLLM_ROCM_PREFIX_PREFILL_TILE_M": lambda: int(
@@ -1752,6 +1758,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
         "VLLM_ROCM_USE_GFX936_AITER_GEMV",
+        "VLLM_ROCM_QWEN35_FUSED_GATEUP_SILU",
         "VLLM_ROCM_PREFIX_PREFILL_TILE_M",
         "VLLM_ROCM_PREFIX_PREFILL_TILE_N",
         "VLLM_ROCM_PREFIX_PREFILL_NUM_WARPS",

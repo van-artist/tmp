@@ -18,10 +18,16 @@ stored in this branch.
 export VLLM_ROCM_USE_AITER=0
 export VLLM_ROCM_USE_AITER_TRITON_GEMM=1
 export VLLM_ROCM_USE_GFX936_AITER_GEMV=1
+export VLLM_ROCM_QWEN35_FUSED_GATEUP_SILU=1
 export VLLM_ROCM_USE_SKINNY_GEMM=0
 export VLLM_ROCM_PREFIX_PREFILL_TILE_M=64
 export VLLM_ROCM_PREFIX_PREFILL_TILE_N=32
 export VLLM_ROCM_PREFIX_PREFILL_NUM_WARPS=4
+export VLLM_ROCM_QWEN35_UNIFIED_BLOCK_M=64
+export VLLM_ROCM_QWEN35_UNIFIED_TILE_SIZE=32
+export VLLM_ROCM_QWEN35_UNIFIED_NUM_WARPS=4
+export VLLM_ROCM_QWEN35_UNIFIED_NUM_STAGES=1
+export VLLM_ROCM_QWEN35_UNIFIED_WAVES_PER_EU=1
 export TORCH_BLAS_PREFER_HIPBLASLT=0
 
 vllm serve /path/to/Qwen3.5-27B \
@@ -49,4 +55,5 @@ Run the supplied official scripts and require zero failures/empty errors:
 
 Check health, completed count, output token sum, P99 TTFT/TPOT and accuracy
 before choosing the high-score branch. Set
-`VLLM_ROCM_USE_GFX936_AITER_GEMV=0` for a numerical rollback comparison.
+`VLLM_ROCM_QWEN35_FUSED_GATEUP_SILU=0` and/or
+`VLLM_ROCM_USE_GFX936_AITER_GEMV=0` for numerical rollback comparisons.

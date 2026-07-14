@@ -20,9 +20,20 @@ guards. Unsupported shapes and environments retain the upstream path.
    `gemm_a16w16` configurations. Dispatch requires gfx936, BF16, TP1, no bias,
    equal dtype/device and contiguous tensors. The packed 16480-wide GDN
    projection deliberately remains one hipBLAS GEMM because every measured
-   split/AITER variant was slower. Weights remain BF16 in their original
-   layout.
-2. **Exact 784-page gather plus dense ROCm FlashAttention.** The normal decode
+   split/AITER variant was slower.
+2. **BF16 gate/up GEMV plus SwiGLU fusion.** Dense-layer M=1 decode uses a
+   model-specific Triton kernel that accumulates both original BF16 weight
+   halves and immediately applies the original SiLU-and-multiply sequence.
+   The kernel explicitly reproduces both intermediate BF16 round trips, keeps
+   the checkpoint weight and output in BF16, and creates no alternate weight
+   representation. Every non-M=1, non-gfx936, non-BF16, noncontiguous or
+   mismatched shape falls back to the original BF16 GEMV and activation.
+3. **Pack the tiny GDN b/a projection into qkvz.** Qwen3.5-27B has only 96 b/a
+   outputs beside 16,384 q/k/v/z outputs. Its six original BF16 checkpoint
+   shards are loaded into one 16,480-wide `MergedColumnParallelLinear`, and
+   the former b/a module is a parameter-free `nn.Identity`. This removes one
+   launch in each GDN layer without changing any tensor value or precision.
+4. **Exact 784-page gather plus dense ROCm FlashAttention.** The normal decode
    path and a prompt's first scheduler chunk remain on paged `TRITON_ATTN`.
    For each continuation chunk of a single Qwen3.5 BF16 prefill request, a
    page-major Triton kernel gathers the exact interleaved
@@ -35,19 +46,19 @@ guards. Unsupported shapes and environments retain the upstream path.
    risk for only about 39.5 ms per request in the measured model. Decode,
    mixed batches, capture, cascade, cross-attention, sliding-window, ALiBi,
    sinks and every other geometry fall back unchanged.
-3. **Qwen3.5 GDN prefill fusion.** Projection splitting, convolution input
+5. **Qwen3.5 GDN prefill fusion.** Projection splitting, convolution input
    preparation, recurrent-state packing, gated RMSNorm and post-convolution
    work are specialized for the official single-request 4096-token chunks.
    The recurrent calculation and state update are exact; scheduler padding
    rows are explicitly cleared. A strided `z` view is consumed directly to
    avoid materializing a roughly 48 MiB contiguous copy per GDN layer and
    chunk.
-4. **Fused full-attention preparation.** Q gate, per-head Gemma RMSNorm,
+6. **Fused full-attention preparation.** Q gate, per-head Gemma RMSNorm,
    partial NeoX RoPE and K normalization are performed in a guarded Triton
    kernel. Gemma norm parameters are loaded in FP32 and incremented inside the
    kernel, which is numerically equivalent to constructing temporary
    `weight.float() + 1` tensors but removes those launches and allocations.
-5. **Direct output projection into the layer buffer.** Both GDN and full
+7. **Direct output projection into the layer buffer.** Both GDN and full
    attention normally materialize a `[tokens, 5120]` GEMM result and then copy
    it into a caller-owned buffer. An exact mutable custom op writes the
    unquantized TP1 BF16 `[tokens,6144] @ [6144,5120]` result directly into that
@@ -55,17 +66,17 @@ guards. Unsupported shapes and environments retain the upstream path.
    functionalization cannot recreate the temporary and copy. Quantization,
    bias, LoRA/batch-invariant execution, other shapes and other models retain
    the original `RowParallelLinear` path.
-6. **Measured unified-attention fallback tuning.** The original paged Triton
+8. **Measured unified-attention fallback tuning.** The original paged Triton
    implementation remains the fallback and uses the measured gfx936 Qwen3.5
    M=64 query geometry only for its exact guarded shape. Logical and physical
    KV traversal and the 784-token page remain unchanged.
-7. **Scalar page lookup for decode tiles.** Decode uses a 16-token K/V tile,
+9. **Scalar page lookup for decode tiles.** Decode uses a 16-token K/V tile,
    and the fixed 784-token physical page is exactly 49 such tiles. Therefore a
    tile cannot cross a page boundary: the 3-D paged kernel loads one physical
    block index per tile and derives the 16 in-page offsets arithmetically,
    instead of repeating division, remainder and page-table loads in every
    lane. K/V addresses and the FP32 softmax reduction order are unchanged.
-8. **Length-specialized decode softmax.** Single-request decode uses 128
+10. **Length-specialized decode softmax.** Single-request decode uses 128
    independent segments through 24K and 64 beyond that point, with a measured
    two-warp, one-stage gfx936 launch. A graph-stable 128-segment allocation is
    shared by both paths; the long path reads and writes only its first half.
@@ -73,12 +84,18 @@ guards. Unsupported shapes and environments retain the upstream path.
    statistics and the final reduction in FP32. It is an explicitly
    higher-throughput candidate because segment partitioning changes
    floating-point reduction grouping.
+11. **Processor-free greedy sampler fast path.** On gfx936, contiguous BF16
+   logits for a request that is entirely greedy, asks for no logprobs and has
+   no penalties, masks, bad words or non-argmax-invariant processors go
+   directly to `argmax`. This avoids a redundant full-vocabulary FP32 copy.
+   Every feature-bearing sampling path retains the original FP32 processing.
 
 ## Validation and screening evidence
 
-The last public evaluation of the parent
-`pra26-unified-adaptive-gdn-memory` was AC with no SLA or accuracy deduction:
-19.24 / 17.04 / 13.29 tok/s for 4-8K / 8-16K / 16-32K.
+The last public evaluation of the clean BF16 parent
+`pra26-flash784-cont-pagefast-gdn-memory` was AC with no SLA or accuracy
+deduction: 19.46 / 17.99 / 14.85 tok/s for 4-8K / 8-16K / 16-32K. These are
+public parent results, not a claim for this branch.
 
 The dense-attention candidate was screened with the official serving command,
 two warmups, concurrency 1 and the same first five prompts. All 15 requests
@@ -98,6 +115,25 @@ the changed BF16 reduction order were at most 0.001953 / 0.000976 / 0.000488
 for continuation chunks. These are screening results, not a claimed hidden-set
 score.
 
+For the new dense gate/up fusion, the exact M=1 `[1,5120] @ [34816,5120]`
+remote microbenchmark measured approximately 0.3211 ms for AITER GEMV plus
+the separate activation and 0.3129--0.3140 ms for the fused operation. M=1,
+the M=2 fallback and a full-graph custom-op call all matched their respective
+BF16 references bit for bit on the screening tensors.
+
+A same-code, same-node serving A/B changed only
+`VLLM_ROCM_QWEN35_FUSED_GATEUP_SILU`. With two fixed prompts per bucket and
+two warmups, enabling the fusion reduced P99 TPOT from 47.20 / 47.55 / 48.07
+ms to 46.67 / 47.06 / 47.66 ms. All six generated texts and output lengths
+(150 / 104 / 288 tokens by bucket) were identical. The small prompt count is
+a compatibility and direction screen, not a substitute for official scoring.
+
+An end-to-end OpenCompass smoke run then evaluated two rows from each official
+task family. It completed without service errors and reported HotpotQA 100.00,
+GovReport 39.79, retrieval-multi-point 100.00 and keyword-aggregation 100.00.
+This verifies all four accuracy routes and output parsing; the official full
+hidden-set evaluation remains authoritative.
+
 ## Rejected experiments
 
 - Changing the physical KV page: rejected because page geometry is a locked
@@ -116,10 +152,15 @@ score.
   long-context runs and/or changed generations.
 - Global hipBLASLt preference and AITER for down/out/BA/lm_head: measured
   regressions; lm_head also failed the numerical gate.
+- Persistent gate/up INT8, persistent lm-head quantization and load-time
+  reusable low-precision weight copies: rejected as outside the permitted
+  optimization scope. This branch contains none of these paths.
 
 ## Source locations
 
 - `vllm/model_executor/layers/utils.py`: exact GEMV dispatch.
+- `vllm/model_executor/layers/qwen35_gateup_silu.py`: guarded BF16 gated GEMV
+  plus SwiGLU fusion.
 - `vllm/model_executor/layers/fla/ops/`: guarded GDN fusion and recurrent ops.
 - `vllm/model_executor/layers/fused_qk_norm_rope.py`: Q/K norm, gate and RoPE.
 - `vllm/model_executor/models/qwen3_5.py` and `qwen3_next.py`: model routing.
@@ -127,4 +168,5 @@ score.
   and builder-owned dense scratch.
 - `vllm/v1/attention/ops/triton_qwen35_kv_gather.py`: exact paged K/V gather.
 - `vllm/v1/attention/ops/triton_unified_attention.py`: guarded fallback tile.
+- `vllm/v1/sample/sampler.py`: processor-free BF16 greedy fast path.
 - `vllm/platforms/rocm.py`: isolated gfx936 predicate.

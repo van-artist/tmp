@@ -2,9 +2,10 @@
 
 This branch is based on OpenDAS/vLLM `v0.18.1` (`fa71803`). It uses the fixed
 environment's ROCm AITER and FlashAttention Python APIs together with vLLM
-Triton kernels; no third-party source or binary has been copied into the
-repository. The competition changes, exact guards, rejected experiments,
-provenance and screening measurements are described in
+Triton kernels. One model-specific BF16 fusion is adapted from an MIT-licensed
+AITER Triton kernel; every dependency and adapted/backported source is listed
+in the third-party notice. The competition changes, exact guards, rejected
+experiments, provenance and screening measurements are described in
 [OPTIMIZATION.md](OPTIMIZATION.md) and
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 

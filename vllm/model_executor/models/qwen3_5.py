@@ -61,6 +61,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_5 import (
     Qwen3_5Config,
@@ -289,6 +290,14 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
+            if (
+                current_platform.is_rocm()
+                and quant_config is None
+                and config.hidden_size == 5120
+                and config.intermediate_size == 17408
+                and self.mlp.gate_up_proj.tp_size == 1
+            ):
+                self.mlp.gate_up_proj._qwen35_bf16_fused_silu = True
         else:
             raise ValueError(f"Invalid model_type {config.model_type}")
 
