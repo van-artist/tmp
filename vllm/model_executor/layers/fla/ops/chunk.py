@@ -12,6 +12,7 @@ import warnings
 import torch
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from .chunk_fused import chunk_fused_fwd_h_o
 from .chunk_o import chunk_fwd_o
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
@@ -47,6 +48,19 @@ def chunk_gated_delta_rule_fwd(
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
     )
+    if out is not None and cu_seqlens is None:
+        output, final_state = chunk_fused_fwd_h_o(
+            k=k,
+            w=w,
+            u=u,
+            q=q,
+            g=g,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            out=out,
+        )
+        return g, output, A, final_state, None, None, None
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
