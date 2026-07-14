@@ -120,6 +120,7 @@ def kernel_unified_attention_2d(
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
     USE_FP8: tl.constexpr,  # bool
+    DELAY_V_LOAD: tl.constexpr,  # gfx936 experiment: shorten V live range
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -308,20 +309,21 @@ def kernel_unified_attention_2d(
         else:
             K = K_load
 
-        # V : (TILE_SIZE, HEAD_SIZE)
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=dim_mask[None, :] & tile_mask[:, None],
-            other=0.0,
-        )
+        if not DELAY_V_LOAD:
+            # Baseline ordering. V remains live across QK and online softmax.
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+            )
 
-        if V_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                V = V_load
+            if V_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    V = V_load
+                else:
+                    V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
             else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
-        else:
-            V = V_load
+                V = V_load
 
         # Compute attention mask: causal by default (key <= query)
         query_abs_pos = context_len + query_pos[:, None]
@@ -415,6 +417,23 @@ def kernel_unified_attention_2d(
         # update constants
         L = L * alpha + l_j
         M = m_j
+
+        if DELAY_V_LOAD:
+            # Load V only after QK and online softmax. This keeps the V tile
+            # out of the longest live range and may reduce gfx936 VGPR usage.
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+            )
+
+            if V_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    V = V_load
+                else:
+                    V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+            else:
+                V = V_load
 
         if SLIDING_WINDOW:
             qpos_lo = q_block_local_idx * BLOCK_Q
@@ -979,6 +998,7 @@ def unified_attention(
     mm_prefix_range=None,
     use_alibi_sqrt=False,
     gfx936_qwen35_prefill=False,
+    gfx936_delay_v_load=None,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -1041,6 +1061,15 @@ def unified_attention(
         QWEN35_WAVES_PER_EU = _qwen35_prefill_tuning(
             "VLLM_ROCM_QWEN35_UNIFIED_WAVES_PER_EU", 1, (1, 2, 4)
         )
+        QWEN35_DELAY_V_LOAD = (
+            bool(gfx936_delay_v_load)
+            if gfx936_delay_v_load is not None
+            else bool(
+                _qwen35_prefill_tuning(
+                    "VLLM_ROCM_QWEN35_DELAY_V_LOAD", 0, (0, 1)
+                )
+            )
+        )
     else:
         BLOCK_M = (
             16
@@ -1084,6 +1113,7 @@ def unified_attention(
         }
     else:
         qwen35_launch_config = {}
+        QWEN35_DELAY_V_LOAD = False
 
     # Launch the 2D kernel if
     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
@@ -1154,6 +1184,7 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
+            DELAY_V_LOAD=QWEN35_DELAY_V_LOAD,
             **qwen35_launch_config,
         )
     else:
