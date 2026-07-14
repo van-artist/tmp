@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Fused split, Q/K RMSNorm, partial NeoX RoPE and gate copy.
+"""Fused split, Q/K RMSNorm and partial NeoX RoPE.
 
 Backported from upstream vLLM for the Qwen3.5 full-attention layers.  It is
 mathematically equivalent to the original sequence and keeps the BF16
@@ -18,7 +18,6 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     k_ptr,
     q_out_ptr,
     k_out_ptr,
-    gate_out_ptr,
     q_weight_ptr,
     k_weight_ptr,
     cos_sin_cache_ptr,
@@ -27,7 +26,6 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     k_stride_t,
     q_out_stride_t,
     k_out_stride_t,
-    gate_out_stride_t,
     cache_stride_p,
     num_q_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
@@ -113,18 +111,6 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     tl.store(out_base + rot_offs, out1, mask=rot_mask)
     tl.store(out_base + half_rotary + rot_offs, out2, mask=rot_mask)
 
-    if not is_k:
-        gate_in_base = in_base + head_dim
-        gate_out_base = (
-            gate_out_ptr
-            + token * gate_out_stride_t
-            + local_head * head_dim
-        )
-        gate = tl.load(
-            gate_in_base + head_offs, mask=head_mask, other=0.0
-        )
-        tl.store(gate_out_base + head_offs, gate, mask=head_mask)
-
 
 def fused_qk_rmsnorm_rope_gate(
     q_gate: torch.Tensor,
@@ -139,7 +125,14 @@ def fused_qk_rmsnorm_rope_gate(
     head_dim: int,
     rotary_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return Q/K and gate using raw Gemma RMSNorm offset weights."""
+    """Return Q/K and a zero-copy strided gate view.
+
+    Qwen stores each query head as ``[q, gate]``.  The packed projection stays
+    live until gating finishes, so copying all gate values into another dense
+    tensor only adds an HBM round trip.  Returning the per-head view preserves
+    the exact BF16 values and lets the caller fuse sigmoid/multiply while
+    reading the original projection directly.
+    """
     if rotary_dim <= 0 or rotary_dim > head_dim or rotary_dim % 2 != 0:
         raise ValueError(
             "rotary_dim must be a positive even integer <= head_dim, "
@@ -156,9 +149,11 @@ def fused_qk_rmsnorm_rope_gate(
         dtype=k.dtype,
         device=k.device,
     )
-    gate_out = torch.empty_like(q_out)
+    gate_view = q_gate.view(num_tokens, num_q_heads, 2 * head_dim)[
+        ..., head_dim:
+    ]
     if num_tokens == 0:
-        return q_out, k_out, gate_out
+        return q_out, k_out, gate_view
 
     half_rotary = rotary_dim // 2
     head_block = triton.next_power_of_2(head_dim)
@@ -170,7 +165,6 @@ def fused_qk_rmsnorm_rope_gate(
         k,
         q_out,
         k_out,
-        gate_out,
         q_weight,
         k_weight,
         cos_sin_cache,
@@ -179,7 +173,6 @@ def fused_qk_rmsnorm_rope_gate(
         k.stride(0),
         q_out.stride(0),
         k_out.stride(0),
-        gate_out.stride(0),
         cos_sin_cache.stride(0),
         num_q_heads,
         num_kv_heads,
@@ -196,4 +189,4 @@ def fused_qk_rmsnorm_rope_gate(
         num_warps=num_warps,
         num_stages=2,
     )
-    return q_out, k_out, gate_out
+    return q_out, k_out, gate_view

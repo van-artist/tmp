@@ -1377,8 +1377,20 @@ class Qwen3NextAttention(nn.Module):
         attn_output = self.attn(q, k, v)
 
         if gate is not None:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            if gate.ndim == 3:
+                # The fused Q/K path returns a zero-copy [T, H, D] view into
+                # the packed q/gate projection.  Keep that view strided and
+                # reshape the dense attention output instead of materializing
+                # a separate [T, H*D] gate tensor.
+                attn_output_3d = attn_output.view(
+                    -1, self.num_heads, self.head_dim
+                )
+                attn_output = (
+                    attn_output_3d * torch.sigmoid(gate)
+                ).view_as(attn_output)
+            else:
+                gate = torch.sigmoid(gate)
+                attn_output = attn_output * gate
 
         if _can_use_qwen35_bf16_linear_out(
             self.config, self.o_proj, attn_output, output
