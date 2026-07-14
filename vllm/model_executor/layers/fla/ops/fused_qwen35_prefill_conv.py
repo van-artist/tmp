@@ -112,6 +112,7 @@ def _conv_prep_cumsum_4096_kernel(
     K: tl.constexpr,
     V: tl.constexpr,
     WIDTH: tl.constexpr,
+    FUSE_QK_NORM: tl.constexpr,
 ):
     pid = tl.program_id(0)
     qk_tasks: tl.constexpr = H * NT
@@ -142,6 +143,14 @@ def _conv_prep_cumsum_4096_kernel(
             stride_state_tok,
             WIDTH,
         )
+        if FUSE_QK_NORM:
+            # _conv_silu_bf16_tile has already reproduced the original
+            # causal-convolution BF16 store/load boundary.  Normalize that
+            # exact BF16 value before its only materialization, avoiding the
+            # later Q read + Q write in the standalone in-place launch.
+            q_f32 *= (
+                1.0 / tl.sqrt(tl.sum(q_f32 * q_f32, axis=1) + 1e-6)
+            )[:, None]
         tl.store(q_ptr + tokens * stride_q_tok + i_h * K + features, q_f32)
 
         k_channels = H * K + i_h * K + features
@@ -161,6 +170,10 @@ def _conv_prep_cumsum_4096_kernel(
             stride_state_tok,
             WIDTH,
         )
+        if FUSE_QK_NORM:
+            k_f32 *= (
+                1.0 / tl.sqrt(tl.sum(k_f32 * k_f32, axis=1) + 1e-6)
+            )[:, None]
         tl.store(k_ptr + tokens * stride_k_tok + i_h * K + features, k_f32)
 
         # The first tile has already consumed the old state.  It is the sole
@@ -384,8 +397,15 @@ def fused_qwen35_prefill_conv_prep(
     b: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
+    fuse_qk_norm: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the already-guarded exact B=1/T=4096 two-launch fusion."""
+    """Run the already-guarded exact B=1/T=4096 convolution fusion.
+
+    ``fuse_qk_norm=False`` retains the prior two-launch implementation for
+    target-device A/B and bitwise validation.  The production default keeps
+    the convolution BF16 rounding boundary inside the first launch, then
+    normalizes Q/K before their only HBM store.
+    """
     q = torch.empty((_T, _H, _K), device=mixed_qkv.device, dtype=mixed_qkv.dtype)
     k = torch.empty_like(q)
     v = torch.empty(
@@ -435,24 +455,26 @@ def fused_qwen35_prefill_conv_prep(
         K=_K,
         V=_V,
         WIDTH=_WIDTH,
+        FUSE_QK_NORM=fuse_qk_norm,
         num_warps=2,
         num_stages=1,
         waves_per_eu=1,
     )
 
-    norm_block_t = 16
-    norm_nt = _T // norm_block_t
-    _qk_norm_4096_inplace_kernel[(_H * norm_nt,)](
-        q,
-        k,
-        q.stride(0),
-        k.stride(0),
-        NT=norm_nt,
-        BLOCK_T=norm_block_t,
-        H=_H,
-        K=_K,
-        num_warps=2,
-        num_stages=1,
-        waves_per_eu=1,
-    )
+    if not fuse_qk_norm:
+        norm_block_t = 16
+        norm_nt = _T // norm_block_t
+        _qk_norm_4096_inplace_kernel[(_H * norm_nt,)](
+            q,
+            k,
+            q.stride(0),
+            k.stride(0),
+            NT=norm_nt,
+            BLOCK_T=norm_block_t,
+            H=_H,
+            K=_K,
+            num_warps=2,
+            num_stages=1,
+            waves_per_eu=1,
+        )
     return q, k, v, g, beta
