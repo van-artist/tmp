@@ -97,6 +97,56 @@ def _page_major_gather_kernel(
 
 
 @triton.jit
+def _page_major_loop_gather_kernel(
+    key_cache,
+    value_cache,
+    dense_key,
+    dense_value,
+    block_table,
+    total_tokens,
+    stride_k_block,
+    stride_v_block,
+    PAGE_SIZE: tl.constexpr,
+    ROW_SIZE: tl.constexpr,
+    TOKENS_PER_PROGRAM: tl.constexpr,
+):
+    """Reuse one page-table load while copying one row at a time.
+
+    Unlike ``_page_major_gather_kernel``, this does not construct a
+    [TOKENS_PER_PROGRAM, ROW_SIZE] tile.  Only one 1024-element K/V row is
+    live in each loop iteration, reducing VGPR pressure on wave64 GPUs.
+    """
+    token_group = tl.program_id(0)
+    logical_page = tl.program_id(1)
+    element_offsets = tl.arange(0, ROW_SIZE)
+    physical_page = tl.load(block_table + logical_page).to(tl.int64)
+    page_input_base = physical_page * stride_k_block
+    page_value_base = physical_page * stride_v_block
+    logical_token_base = logical_page * PAGE_SIZE
+
+    for token_delta in tl.range(
+        0, TOKENS_PER_PROGRAM, loop_unroll_factor=1
+    ):
+        in_page_token = token_group * TOKENS_PER_PROGRAM + token_delta
+        global_token = logical_token_base + in_page_token
+        mask = (in_page_token < PAGE_SIZE) & (global_token < total_tokens)
+        within = in_page_token * ROW_SIZE + element_offsets
+        dense_offsets = global_token * ROW_SIZE + element_offsets
+        key = tl.load(
+            key_cache + page_input_base + within,
+            mask=mask,
+            other=0.0,
+        )
+        tl.store(dense_key + dense_offsets, key, mask=mask)
+        value = tl.load(
+            value_cache + page_value_base + within,
+            mask=mask,
+            other=0.0,
+        )
+        tl.store(dense_value + dense_offsets, value, mask=mask)
+
+
+@triton.jit
 def _contiguous_page_gather_kernel(
     key_cache,
     value_cache,
@@ -164,6 +214,28 @@ def _launch_page(cache, dense, table, tokens, page_size, tpp, warps):
     dense_key, dense_value = dense
     grid = (triton.cdiv(page_size, tpp), triton.cdiv(tokens, page_size))
     _page_major_gather_kernel[grid](
+        key_cache,
+        value_cache,
+        dense_key,
+        dense_value,
+        table,
+        tokens,
+        key_cache.stride(0),
+        value_cache.stride(0),
+        PAGE_SIZE=page_size,
+        ROW_SIZE=ROW_SIZE,
+        TOKENS_PER_PROGRAM=tpp,
+        num_warps=warps,
+        num_stages=1,
+        waves_per_eu=1,
+    )
+
+
+def _launch_page_loop(cache, dense, table, tokens, page_size, tpp, warps):
+    key_cache, value_cache = cache
+    dense_key, dense_value = dense
+    grid = (triton.cdiv(page_size, tpp), triton.cdiv(tokens, page_size))
+    _page_major_loop_gather_kernel[grid](
         key_cache,
         value_cache,
         dense_key,
@@ -272,6 +344,34 @@ def run_case(tokens: int, page_size: int) -> None:
             )
             print(
                 f"page/table tpp={tpp:2d} warps={warps}: "
+                f"{elapsed:.4f} ms, {_bandwidth_gbps(tokens, elapsed):.1f} "
+                f"GB/s, {row_ms / elapsed:.3f}x"
+            )
+
+    print("low-live-range page loop:")
+    for tpp in (4, 8, 16):
+        for warps in (2, 4, 8):
+            _launch_page_loop(
+                cache, output, random_table, tokens, page_size, tpp, warps
+            )
+            torch.cuda.synchronize()
+            torch.testing.assert_close(dense_key, reference_key, atol=0, rtol=0)
+            torch.testing.assert_close(
+                dense_value, reference_value, atol=0, rtol=0
+            )
+            elapsed = do_bench(
+                lambda tpp=tpp, warps=warps: _launch_page_loop(
+                    cache,
+                    output,
+                    random_table,
+                    tokens,
+                    page_size,
+                    tpp,
+                    warps,
+                )
+            )
+            print(
+                f"page-loop  tpp={tpp:2d} warps={warps}: "
                 f"{elapsed:.4f} ms, {_bandwidth_gbps(tokens, elapsed):.1f} "
                 f"GB/s, {row_ms / elapsed:.3f}x"
             )
