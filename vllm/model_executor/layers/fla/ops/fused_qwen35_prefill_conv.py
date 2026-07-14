@@ -102,8 +102,10 @@ def _conv_prep_cumsum_4096_kernel(
     stride_q_tok: tl.constexpr,
     stride_k_tok: tl.constexpr,
     stride_v_tok: tl.constexpr,
+    QK_NT: tl.constexpr,
     NT: tl.constexpr,
     NGT: tl.constexpr,
+    QK_BLOCK_T: tl.constexpr,
     BLOCK_T: tl.constexpr,
     GATE_T: tl.constexpr,
     T: tl.constexpr,
@@ -115,15 +117,15 @@ def _conv_prep_cumsum_4096_kernel(
     FUSE_QK_NORM: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    qk_tasks: tl.constexpr = H * NT
+    qk_tasks: tl.constexpr = H * QK_NT
     value_tasks: tl.constexpr = HV * NT
     cache_idx = tl.load(state_indices_ptr).to(tl.int64)
     has_initial = tl.load(has_initial_ptr).to(tl.int1)
 
     if pid < qk_tasks:
-        i_h = pid // NT
-        i_tb = pid - i_h * NT
-        tokens = i_tb * BLOCK_T + tl.arange(0, BLOCK_T)[:, None]
+        i_h = pid // QK_NT
+        i_tb = pid - i_h * QK_NT
+        tokens = i_tb * QK_BLOCK_T + tl.arange(0, QK_BLOCK_T)[:, None]
         features = tl.arange(0, K)[None, :]
 
         q_channels = i_h * K + features
@@ -414,11 +416,17 @@ def fused_qwen35_prefill_conv_prep(
     g = torch.empty((_T, _HV), device=mixed_qkv.device, dtype=torch.float32)
     beta = torch.empty_like(g)
 
+    # The standalone exact Q/K norm uses 16 tokens per program.  Match that
+    # geometry in the fused specialization so Triton's warp reduction order
+    # remains bitwise identical; retain the measured 8-token convolution
+    # geometry for the reference/fallback path and all value heads.
+    qk_block_t = 16 if fuse_qk_norm else 8
+    qk_nt = _T // qk_block_t
     block_t = 8
     nt = _T // block_t
     gate_t = 64
     ngt = _T // gate_t
-    grid = (_H * nt + _HV * nt + _HV * ngt,)
+    grid = (_H * qk_nt + _HV * nt + _HV * ngt,)
     _conv_prep_cumsum_4096_kernel[grid](
         mixed_qkv,
         conv_weight,
@@ -445,8 +453,10 @@ def fused_qwen35_prefill_conv_prep(
         q.stride(0),
         k.stride(0),
         v.stride(0),
+        QK_NT=qk_nt,
         NT=nt,
         NGT=ngt,
+        QK_BLOCK_T=qk_block_t,
         BLOCK_T=block_t,
         GATE_T=gate_t,
         T=_T,
