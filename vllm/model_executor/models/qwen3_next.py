@@ -749,10 +749,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         When the first real inference triggers the autotuner it OOMs
         because there is not enough memory left for benchmarking.
 
-        This method runs minimal forward passes through
-        ``chunk_gated_delta_rule`` with small dummy tensors to force
-        autotuning while GPU memory is still plentiful.  The autotuner
-        results are cached globally, so only the first layer incurs
+        This method runs forward passes through ``chunk_gated_delta_rule``
+        while GPU memory is still plentiful.  Several FLA kernels do not put
+        sequence length in their autotune key, so tune the contest's real
+        4096-token prefill shape before the short BT-coverage shapes.  The
+        autotuner results are cached globally, so only the first layer incurs
         actual benchmarking cost.
 
         Most kernels use a fixed ``BT = chunk_size`` (64), but
@@ -775,11 +776,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         num_v_heads = self.num_v_heads // self.tp_size
         _, state_dtype = self.get_state_dtype()
 
-        # Run warmup for each possible BT value of chunk_fwd_kernel_o:
-        #   T=16 → BT=16, T=32 → BT=32, T=64 → BT=64.
-        # Other kernels always use BT=chunk_size(64), so their autotune
-        # cache is populated on the first pass and reused thereafter.
-        for T in (16, 32, 64):
+        # Tune the real B=1/T=4096 throughput shape first.  Then cover every
+        # smaller BT value used by chunk_fwd_kernel_o.  This ordering matters
+        # for the other kernels whose autotune keys omit T.
+        for T in (4096, 16, 32, 64):
             dummy_mixed_qkv = torch.randn(
                 T,
                 2 * num_k_heads * self.head_k_dim
