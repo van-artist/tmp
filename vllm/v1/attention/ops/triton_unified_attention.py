@@ -120,6 +120,7 @@ def kernel_unified_attention_2d(
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
     USE_FP8: tl.constexpr,  # bool
+    CAUSAL_FULL_TILE_FAST: tl.constexpr,  # skip causal matrix for history tiles
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -189,6 +190,8 @@ def kernel_unified_attention_2d(
 
     # context length for this particular sequences
     context_len = seq_len - cur_batch_query_len
+    query_abs_pos = context_len + query_pos[:, None]
+    earliest_query_abs = context_len + q_block_local_idx * BLOCK_Q
 
     # alibi slope for this head
     if USE_ALIBI_SLOPES:
@@ -323,38 +326,53 @@ def kernel_unified_attention_2d(
         else:
             V = V_load
 
-        # Compute attention mask: causal by default (key <= query)
-        query_abs_pos = context_len + query_pos[:, None]
-        seq_mask = seq_offset[None, :] <= query_abs_pos
+        fully_visible = (
+            (j + 1) * TILE_SIZE <= earliest_query_abs + 1
+            if CAUSAL_FULL_TILE_FAST
+            else False
+        )
+        if not fully_visible:
+            # Compute attention mask only for diagonal/tail tiles. The exact
+            # Qwen long-prefill path has hundreds of fully visible history
+            # tiles for which this BLOCK_M x TILE_SIZE comparison is redundant.
+            seq_mask = seq_offset[None, :] <= query_abs_pos
 
-        # Apply sliding window to base mask BEFORE mm_prefix OR.
-        # Order must match FlexAttention: (causal AND sliding_window) OR mm_prefix
-        if SLIDING_WINDOW > 0:
-            seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
-
-        # PrefixLM: extend mask with bidirectional ranges for multimodal tokens.
-        # Applied AFTER sliding window so mm_prefix ranges override SW restriction.
-        if USE_MM_PREFIX:
-            for i in range(MAX_MM_RANGES):
-                range_start = tl.load(
-                    mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2
-                )
-                range_end = tl.load(
-                    mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2 + 1
+            # Apply sliding window to base mask BEFORE mm_prefix OR.
+            # Order must match FlexAttention:
+            # (causal AND sliding_window) OR mm_prefix.
+            if SLIDING_WINDOW > 0:
+                seq_mask = seq_mask & (
+                    (query_abs_pos - seq_offset) < SLIDING_WINDOW
                 )
 
-                is_valid = range_start < range_end
-                q_in_range = (
-                    (query_abs_pos >= range_start)
-                    & (query_abs_pos <= range_end)
-                    & is_valid
-                )
-                k_in_range = (
-                    (seq_offset[None, :] >= range_start)
-                    & (seq_offset[None, :] <= range_end)
-                    & is_valid
-                )
-                seq_mask |= q_in_range & k_in_range
+            # PrefixLM: extend mask with bidirectional ranges for multimodal
+            # tokens. Applied after sliding window so ranges override it.
+            if USE_MM_PREFIX:
+                for i in range(MAX_MM_RANGES):
+                    range_start = tl.load(
+                        mm_prefix_range_ptr
+                        + seq_idx * MAX_MM_RANGES * 2
+                        + i * 2
+                    )
+                    range_end = tl.load(
+                        mm_prefix_range_ptr
+                        + seq_idx * MAX_MM_RANGES * 2
+                        + i * 2
+                        + 1
+                    )
+
+                    is_valid = range_start < range_end
+                    q_in_range = (
+                        (query_abs_pos >= range_start)
+                        & (query_abs_pos <= range_end)
+                        & is_valid
+                    )
+                    k_in_range = (
+                        (seq_offset[None, :] >= range_start)
+                        & (seq_offset[None, :] <= range_end)
+                        & is_valid
+                    )
+                    seq_mask |= q_in_range & k_in_range
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
@@ -364,9 +382,18 @@ def kernel_unified_attention_2d(
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
 
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
-        )
+        if fully_visible:
+            S = tl.where(
+                query_mask_1[:, None] & query_mask_0[:, None],
+                S,
+                float("-inf"),
+            )
+        else:
+            S = tl.where(
+                query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
+                S,
+                float("-inf"),
+            )
 
         if USE_ALIBI_SLOPES:
             if USE_ALIBI_SQRT:
@@ -982,6 +1009,7 @@ def unified_attention(
     mm_prefix_range=None,
     use_alibi_sqrt=False,
     gfx936_qwen35_prefill=False,
+    gfx936_causal_full_tiles=None,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -1044,6 +1072,18 @@ def unified_attention(
         QWEN35_WAVES_PER_EU = _qwen35_prefill_tuning(
             "VLLM_ROCM_QWEN35_UNIFIED_WAVES_PER_EU", 1, (1, 2, 4)
         )
+        QWEN35_CAUSAL_FULL_TILES = (
+            bool(gfx936_causal_full_tiles)
+            if gfx936_causal_full_tiles is not None
+            else bool(
+                _qwen35_prefill_tuning(
+                    "VLLM_ROCM_QWEN35_CAUSAL_FULL_TILES", 0, (0, 1)
+                )
+            )
+        )
+        if QWEN35_CAUSAL_FULL_TILES:
+            assert window_size == (-1, -1)
+            assert not use_mm_prefix
     else:
         BLOCK_M = (
             16
@@ -1087,6 +1127,7 @@ def unified_attention(
         }
     else:
         qwen35_launch_config = {}
+        QWEN35_CAUSAL_FULL_TILES = False
 
     qwen35_decode_launch_config = {}
     segment_buffer_stride = num_par_softmax_segments
@@ -1187,6 +1228,7 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
+            CAUSAL_FULL_TILE_FAST=QWEN35_CAUSAL_FULL_TILES,
             **qwen35_launch_config,
         )
     else:
