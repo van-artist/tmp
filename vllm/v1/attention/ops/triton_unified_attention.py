@@ -20,6 +20,7 @@ logger = init_logger(__name__)
 is_batch_invariant = vllm_is_batch_invariant()
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
+
 def _qwen35_prefill_tuning(name: str, default: int, allowed: tuple[int, ...]) -> int:
     """Read a guarded exact-shape ROCm tuning override.
 
