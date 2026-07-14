@@ -7,7 +7,6 @@ the established inference path.
 """
 
 import torch
-import torch.nn.functional as F
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -210,5 +209,11 @@ def qwen35_gate_up_swiglu_down(
 ) -> torch.Tensor:
     """Two-kernel full MLP candidate: Gate-Up GEMV, then SwiGLU+Down."""
     _validate_gate_up_inputs(x, gate_up_weight)
-    gate_up = F.linear(x, gate_up_weight)
+    # Match the model's unquantized linear dispatch.  On the exact gfx936
+    # decode shape this selects the retained static AITER Gate-Up kernel.
+    from vllm.model_executor.layers import utils as _linear_utils  # noqa: F401
+
+    gate_up = torch.ops.vllm.rocm_unquantized_gemm(
+        x, gate_up_weight, None
+    )
     return torch.ops.vllm.qwen35_swiglu_down(gate_up, down_weight)

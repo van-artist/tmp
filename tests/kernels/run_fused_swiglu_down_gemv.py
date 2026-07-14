@@ -11,6 +11,9 @@ import torch
 import torch.nn.functional as F
 from triton.testing import do_bench
 
+# Importing utils registers the exact custom op used by an unquantized ROCm
+# Linear layer in the real model path.
+from vllm.model_executor.layers import utils as _linear_utils  # noqa: F401
 from vllm.model_executor.layers.qwen35_fused_mlp import (
     qwen35_gate_up_swiglu_down,
 )
@@ -37,11 +40,26 @@ def make_inputs(seed: int):
     return x, gate_up_weight, down_weight
 
 
-def baseline(x, gate_up_weight, down_weight):
+def reference(x, gate_up_weight, down_weight):
     gate_up = F.linear(x, gate_up_weight)
     gate, up = gate_up.chunk(2, dim=-1)
     activation = F.silu(gate) * up
     return activation, F.linear(activation, down_weight)
+
+
+def model_path(x, gate_up_weight, down_weight):
+    """Reproduce the current model's GEMV, activation and Down dispatch."""
+    gate_up = torch.ops.vllm.rocm_unquantized_gemm(
+        x, gate_up_weight, None
+    )
+    activation = torch.empty(
+        (1, INTERMEDIATE_SIZE), device=x.device, dtype=x.dtype
+    )
+    torch.ops._C.silu_and_mul(activation, gate_up)
+    output = torch.ops.vllm.rocm_unquantized_gemm(
+        activation, down_weight, None
+    )
+    return activation, output
 
 
 def check_close(name: str, actual: torch.Tensor, expected: torch.Tensor):
@@ -77,9 +95,10 @@ def main():
     x, gate_up_weight, down_weight = make_inputs(args.seed)
 
     print("JIT compiling and checking correctness...")
-    reference_activation, reference_output = baseline(
+    reference_activation, reference_output = reference(
         x, gate_up_weight, down_weight
     )
+    model_activation, model_output = model_path(x, gate_up_weight, down_weight)
     fused_activation = torch.ops.vllm.qwen35_gate_up_swiglu(
         x, gate_up_weight
     )
@@ -89,6 +108,8 @@ def main():
     )
     torch.cuda.synchronize()
 
+    check_close("current model activation", model_activation, reference_activation)
+    check_close("current model output", model_output, reference_output)
     check_close("gate_up+swiglu activation", fused_activation, reference_activation)
     check_close(
         "gate_up+swiglu then down", fused_gate_up_output, reference_output
@@ -100,13 +121,15 @@ def main():
         return
 
     def run_baseline():
-        return baseline(x, gate_up_weight, down_weight)[1]
+        return model_path(x, gate_up_weight, down_weight)[1]
 
     def run_fused_gate_up():
         activation = torch.ops.vllm.qwen35_gate_up_swiglu(
             x, gate_up_weight
         )
-        return F.linear(activation, down_weight)
+        return torch.ops.vllm.rocm_unquantized_gemm(
+            activation, down_weight, None
+        )
 
     def run_fused_down():
         return qwen35_gate_up_swiglu_down(x, gate_up_weight, down_weight)
