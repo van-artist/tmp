@@ -3,11 +3,11 @@
 """Exact gfx936 Qwen3.5 prefill convolution/preparation fusion.
 
 The guarded B=1, T=4096 path avoids materializing and rereading the packed
-10240-channel causal-convolution output.  The first launch produces raw BF16
-Q/K, final BF16 V, beta, the local gate cumsum, and updates the width-4
-convolution state.  A small second launch normalizes Q/K in place.  Keeping
-the BF16 Q/K boundary is intentional: it reproduces the production
-causal-conv store followed by the post-conv load bit for bit.
+10240-channel causal-convolution output.  It produces Q/K/V, beta, the local
+gate cumsum, and updates the width-4 convolution state in one launch.  Q/K
+normalization retains an explicit BF16 store/load boundary inside that launch;
+this reproduces the production convolution rounding bit for bit while removing
+the standalone normalization launch.
 """
 
 from __future__ import annotations
@@ -417,8 +417,8 @@ def fused_qwen35_prefill_conv_prep(
 
     ``fuse_qk_norm=False`` retains the prior two-launch implementation for
     target-device A/B and bitwise validation.  The production default keeps
-    the convolution BF16 rounding boundary inside the first launch, then
-    normalizes Q/K before their only HBM store.
+    the convolution BF16 rounding boundary inside the same launch, then
+    normalizes Q/K without a separate kernel launch.
     """
     q = torch.empty((_T, _H, _K), device=mixed_qkv.device, dtype=mixed_qkv.dtype)
     k = torch.empty_like(q)

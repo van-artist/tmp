@@ -7,9 +7,9 @@ Run on the competition gfx936 worker after installing or overlaying this tree::
 
 The reference and candidate use the same production kernel.  The reference
 retains the standalone in-place Q/K-normalization launch; the candidate keeps
-the causal-convolution BF16 rounding boundary but normalizes before Q/K's
-first HBM store.  Every output and the complete convolution cache must be
-bitwise equal before latency is reported.
+the causal-convolution BF16 store/load rounding boundary inside the convolution
+launch.  Every output and the complete convolution cache must be bitwise equal
+before latency is reported.
 """
 
 from __future__ import annotations
@@ -143,12 +143,8 @@ def main() -> None:
     if not on_gfx936():
         raise RuntimeError("This prototype is guarded for gfx936 only")
 
-    qk_bytes = 2 * T * H * K * torch.bfloat16.itemsize
     result = {
         "shape": {"T": T, "H": H, "HV": HV, "K": K, "V": V},
-        "removed_hbm_bytes_per_layer": 2 * qk_bytes,
-        "removed_hbm_mib_per_layer": 2 * qk_bytes / (1024**2),
-        "removed_hbm_gib_per_48_layers": 48 * 2 * qk_bytes / (1024**3),
         "removed_launches_per_48_layers": 48,
         "cases": [
             run_case(False, args.warmup, args.repeats),
