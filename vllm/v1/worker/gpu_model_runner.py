@@ -373,7 +373,8 @@ class ExecuteModelState(NamedTuple):
     sample_tokens(), after execute_model() returns None."""
 
     scheduler_output: "SchedulerOutput"
-    logits: torch.Tensor
+    logits: torch.Tensor | None
+    top1_token_ids: torch.Tensor | None
     spec_decode_metadata: SpecDecodeMetadata | None
     spec_decode_common_attn_metadata: CommonAttentionMetadata | None
     hidden_states: torch.Tensor
@@ -842,6 +843,8 @@ class GPUModelRunner(
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
+        self._qwen35_top1_model: Any | None = None
+        self._qwen35_top1_dispatch_logged = False
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
@@ -2899,6 +2902,45 @@ class GPUModelRunner(
             return self.model.unwrap()
         return self.model
 
+    def _initialize_qwen35_top1(self) -> None:
+        parallel_config = self.parallel_config
+        if (
+            not current_platform.is_rocm()
+            or not envs.VLLM_ROCM_USE_SKINNY_GEMM
+            or self.lora_config is not None
+            or self.speculative_config is not None
+            or self.offload_config.uva.cpu_offload_gb > 0
+            or self.offload_config.prefetch.offload_group_size > 0
+            or parallel_config.tensor_parallel_size != 1
+            or parallel_config.pipeline_parallel_size != 1
+            or parallel_config.data_parallel_size != 1
+            or parallel_config.prefill_context_parallel_size != 1
+            or parallel_config.decode_context_parallel_size != 1
+        ):
+            return
+
+        from vllm.platforms.rocm import on_gfx936
+
+        if not on_gfx936():
+            return
+
+        try:
+            import vllm._rocm_C  # noqa: F401
+        except ImportError:
+            return
+
+        causal_model = getattr(self.model, "language_model", self.model)
+        initialize = getattr(causal_model, "initialize_gfx936_top1", None)
+        if initialize is None or not initialize():
+            return
+
+        self._qwen35_top1_model = causal_model
+        logger.info_once(
+            "[dcu-final-rms-lm-head-top1] enabled for single-request greedy "
+            "sampling (async_scheduling=%s)",
+            self.use_async_scheduling,
+        )
+
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()
         supported_tasks = list[GenerationTask]()
@@ -3232,6 +3274,35 @@ class GPUModelRunner(
             sampling_metadata,
         )
         return sampler_output
+
+    def _can_use_qwen35_top1(
+        self,
+        scheduler_output: "SchedulerOutput",
+        sample_hidden_states: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        if (
+            self._qwen35_top1_model is None
+            or self.input_batch.num_reqs != 1
+            or spec_decode_metadata is not None
+            or self.num_prompt_logprobs
+            or envs.VLLM_COMPUTE_NANS_IN_LOGITS
+            or scheduler_output.has_structured_output_requests
+            or sample_hidden_states.shape != (1, 5120)
+            or sample_hidden_states.dtype != torch.bfloat16
+            or not sample_hidden_states.is_contiguous()
+        ):
+            return False
+
+        sampling_metadata = self.input_batch.sampling_metadata
+        return (
+            sampling_metadata.all_greedy
+            and sampling_metadata.max_num_logprobs is None
+            and sampling_metadata.no_penalties
+            and sampling_metadata.allowed_token_ids_mask is None
+            and not sampling_metadata.bad_words_token_ids
+            and not sampling_metadata.logitsprocs.has_active_non_argmax_invariant
+        )
 
     def _bookkeeping_sync(
         self,
@@ -3921,6 +3992,7 @@ class GPUModelRunner(
                 hidden_states = model_output
                 aux_hidden_states = None
 
+            top1_token_ids = None
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
@@ -3940,7 +4012,24 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                if self._can_use_qwen35_top1(
+                    scheduler_output, sample_hidden_states, spec_decode_metadata
+                ):
+                    assert self._qwen35_top1_model is not None
+                    top1_token_ids = (
+                        self._qwen35_top1_model.compute_gfx936_top1(
+                            sample_hidden_states
+                        )
+                    )
+                    logits = None
+                    if not self._qwen35_top1_dispatch_logged:
+                        logger.info(
+                            "[dcu-final-rms-lm-head-top1] dispatched Qwen3.5 "
+                            "greedy top-1"
+                        )
+                        self._qwen35_top1_dispatch_logged = True
+                else:
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -3974,6 +4063,7 @@ class GPUModelRunner(
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
+            top1_token_ids,
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
@@ -4012,6 +4102,7 @@ class GPUModelRunner(
         (
             scheduler_output,
             logits,
+            top1_token_ids,
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
@@ -4024,6 +4115,10 @@ class GPUModelRunner(
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        if top1_token_ids is not None and grammar_output is not None:
+            logits = self.model.compute_logits(sample_hidden_states)
+            top1_token_ids = None
+
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             apply_grammar_bitmask(
@@ -4031,7 +4126,11 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            if top1_token_ids is None:
+                sampler_output = self._sample(logits, spec_decode_metadata)
+            else:
+                self.input_batch.update_async_output_token_ids()
+                sampler_output = SamplerOutput(top1_token_ids, None)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -4621,6 +4720,7 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
+                self._initialize_qwen35_top1()
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     self.drafter.load_model(self.model)

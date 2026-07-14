@@ -163,3 +163,7 @@ class LogitsProcessors:
     def all(self) -> Iterator["LogitsProcessor"]:
         """Iterator over all logits processors."""
         return chain(self.argmax_invariant, self.non_argmax_invariant)
+
+    @property
+    def has_active_non_argmax_invariant(self) -> bool:
+        return any(processor.is_active() for processor in self.non_argmax_invariant)

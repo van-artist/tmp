@@ -1846,7 +1846,12 @@ class Qwen3NextModel(nn.Module):
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if getattr(self, "defer_final_norm", False):
+            hidden_states = (
+                hidden_states + residual if residual is not None else hidden_states
+            )
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
