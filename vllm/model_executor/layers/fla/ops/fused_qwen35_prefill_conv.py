@@ -354,8 +354,8 @@ def _conv_prep_cumsum_tail_kernel(
     if pid < qk_tasks:
         i_h = pid // qk_nt
         i_tb = pid - i_h * qk_nt
-        tokens = i_tb * QK_BLOCK_T + tl.arange(0, QK_BLOCK_T)[:, None]
-        token_mask = tokens < T
+        qk_tokens = i_tb * QK_BLOCK_T + tl.arange(0, QK_BLOCK_T)[:, None]
+        qk_mask = qk_tokens < T
         features = tl.arange(0, K)[None, :]
 
         q_channels = i_h * K + features
@@ -363,7 +363,7 @@ def _conv_prep_cumsum_tail_kernel(
             x_ptr,
             w_ptr,
             state_ptr,
-            tokens,
+            qk_tokens,
             q_channels,
             cache_idx,
             has_initial,
@@ -377,23 +377,23 @@ def _conv_prep_cumsum_tail_kernel(
             T,
             True,
         )
-        q_offsets = q_ptr + tokens * stride_q_tok + i_h * K + features
+        q_offsets = q_ptr + qk_tokens * stride_q_tok + i_h * K + features
         # Match production's convolution-output BF16 materialization before
         # the feature reduction, including on a partially filled final tile.
-        tl.store(q_offsets, q_f32, mask=token_mask)
+        tl.store(q_offsets, q_f32, mask=qk_mask)
         tl.debug_barrier()
-        q_f32 = tl.load(q_offsets, mask=token_mask, other=0.0).to(tl.float32)
+        q_f32 = tl.load(q_offsets, mask=qk_mask, other=0.0).to(tl.float32)
         q_f32 *= (
             1.0 / tl.sqrt(tl.sum(q_f32 * q_f32, axis=1) + 1e-6)
         )[:, None]
-        tl.store(q_offsets, q_f32, mask=token_mask)
+        tl.store(q_offsets, q_f32, mask=qk_mask)
 
         k_channels = H * K + i_h * K + features
         k_f32 = _conv_silu_bf16_tile(
             x_ptr,
             w_ptr,
             state_ptr,
-            tokens,
+            qk_tokens,
             k_channels,
             cache_idx,
             has_initial,
@@ -407,14 +407,14 @@ def _conv_prep_cumsum_tail_kernel(
             T,
             True,
         )
-        k_offsets = k_ptr + tokens * stride_k_tok + i_h * K + features
-        tl.store(k_offsets, k_f32, mask=token_mask)
+        k_offsets = k_ptr + qk_tokens * stride_k_tok + i_h * K + features
+        tl.store(k_offsets, k_f32, mask=qk_mask)
         tl.debug_barrier()
-        k_f32 = tl.load(k_offsets, mask=token_mask, other=0.0).to(tl.float32)
+        k_f32 = tl.load(k_offsets, mask=qk_mask, other=0.0).to(tl.float32)
         k_f32 *= (
             1.0 / tl.sqrt(tl.sum(k_f32 * k_f32, axis=1) + 1e-6)
         )[:, None]
-        tl.store(k_offsets, k_f32, mask=token_mask)
+        tl.store(k_offsets, k_f32, mask=qk_mask)
 
         if i_tb == 0:
             state_col = tl.arange(0, 4)[:, None]
@@ -450,15 +450,15 @@ def _conv_prep_cumsum_tail_kernel(
         i_hv = local // nt
         i_tb = local - i_hv * nt
         flat_tokens = i_tb * BLOCK_T + tl.arange(0, BLOCK_T)
-        token_mask = flat_tokens < T
-        tokens = flat_tokens[:, None]
+        value_mask = flat_tokens < T
+        value_tokens = flat_tokens[:, None]
         features = tl.arange(0, V)[None, :]
         v_channels = 2 * H * K + i_hv * V + features
         v_f32 = _conv_silu_bf16_tile(
             x_ptr,
             w_ptr,
             state_ptr,
-            tokens,
+            value_tokens,
             v_channels,
             cache_idx,
             has_initial,
@@ -473,20 +473,20 @@ def _conv_prep_cumsum_tail_kernel(
             True,
         )
         tl.store(
-            v_ptr + tokens * stride_v_tok + i_hv * V + features,
+            v_ptr + value_tokens * stride_v_tok + i_hv * V + features,
             v_f32,
-            mask=token_mask[:, None],
+            mask=value_mask[:, None],
         )
 
         b_vals = tl.load(
             b_ptr + flat_tokens * stride_b_tok + i_hv,
-            mask=token_mask,
+            mask=value_mask,
             other=0.0,
         ).to(tl.float32)
         tl.store(
             beta_ptr + flat_tokens * HV + i_hv,
             tl.sigmoid(b_vals),
-            mask=token_mask,
+            mask=value_mask,
         )
 
         if i_tb == 0:
@@ -511,10 +511,10 @@ def _conv_prep_cumsum_tail_kernel(
         i_hv = local // ngt
         i_gt = local - i_hv * ngt
         gate_tokens = i_gt * GATE_T + tl.arange(0, GATE_T)
-        token_mask = gate_tokens < T
+        gate_mask = gate_tokens < T
         a_vals = tl.load(
             a_ptr + gate_tokens * stride_a_tok + i_hv,
-            mask=token_mask,
+            mask=gate_mask,
             other=0.0,
         ).to(tl.float32)
         A_log_val = tl.load(A_log_ptr + i_hv).to(tl.float32)
@@ -527,11 +527,11 @@ def _conv_prep_cumsum_tail_kernel(
         )
         softplus = tl.where(x <= 20.0, softplus, x)
         raw_g = -tl.exp(A_log_val) * softplus
-        raw_g = tl.where(token_mask, raw_g, 0.0)
+        raw_g = tl.where(gate_mask, raw_g, 0.0)
         tl.store(
             g_ptr + gate_tokens * HV + i_hv,
             tl.cumsum(raw_g, axis=0),
-            mask=token_mask,
+            mask=gate_mask,
         )
 
 
