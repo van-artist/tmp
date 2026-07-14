@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -69,6 +69,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     reorder_batch_threshold: int = 1
+    supports_update_block_table: bool = True
 
     def __init__(
         self,
@@ -90,6 +91,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.num_spec = 0
         self.use_spec_decode: bool = self.num_spec > 0
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
+
+        # Metadata can be shared across identical GDN cache groups when only
+        # their state block tables differ. Other cache modes and speculative
+        # decode require additional group-specific metadata.
+        self.supports_update_block_table = (
+            not self.use_spec_decode
+            and self.vllm_config.cache_config.mamba_cache_mode == "none"
+        )
 
         self.use_full_cuda_graph: bool = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
@@ -416,6 +425,56 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
         return attn_metadata
+
+    def update_block_table(
+        self,
+        metadata: GDNAttentionMetadata,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> GDNAttentionMetadata:
+        assert self.supports_update_block_table
+        assert metadata.num_spec_decodes == 0
+        assert metadata.spec_sequence_masks is None
+        num_sequences = metadata.num_prefills + metadata.num_decodes
+        assert blk_table.ndim == 2 and blk_table.shape[1] > 0
+        assert blk_table.shape[0] >= num_sequences
+
+        # In "none" mode mamba_get_block_table_tensor is the identity, and
+        # the non-spec GDN path uses the first state block.
+        non_spec_state_indices_tensor = blk_table[:, 0]
+        non_spec_query_start_loc = metadata.non_spec_query_start_loc
+
+        if (
+            self.use_full_cuda_graph
+            and metadata.num_prefills == 0
+            and metadata.num_decodes <= self.decode_cudagraph_max_bs
+        ):
+            num_decodes = metadata.num_decodes
+            batch_size = metadata.num_actual_tokens
+
+            self.non_spec_state_indices_tensor[:num_decodes].copy_(
+                non_spec_state_indices_tensor[:num_decodes], non_blocking=True
+            )
+            non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[
+                :batch_size
+            ]
+            non_spec_state_indices_tensor[num_decodes:].fill_(PAD_SLOT_ID)
+
+            assert non_spec_query_start_loc is not None
+            self.non_spec_query_start_loc[: num_decodes + 1].copy_(
+                non_spec_query_start_loc[: num_decodes + 1], non_blocking=True
+            )
+            num_query_tokens = non_spec_query_start_loc[num_decodes]
+            non_spec_query_start_loc = self.non_spec_query_start_loc[
+                : batch_size + 1
+            ]
+            non_spec_query_start_loc[num_decodes + 1 :].fill_(num_query_tokens)
+
+        return replace(
+            metadata,
+            non_spec_query_start_loc=non_spec_query_start_loc,
+            non_spec_state_indices_tensor=non_spec_state_indices_tensor,
+        )
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
