@@ -816,9 +816,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             )
             cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.long)
 
-            # Warm both the general varlen route used by accuracy/mixed
-            # batches and the fixed B=1 route used by the throughput test.
-            for warmup_cu_seqlens in (cu_seqlens, None):
+            # Tune the fixed B=1 route used by the throughput test before the
+            # general varlen route.  Several FLA autotune keys omit varlen/T,
+            # so the first winner is also reused by the production path.
+            for warmup_cu_seqlens in (None, cu_seqlens):
                 mode = "varlen" if warmup_cu_seqlens is not None else "fixed"
                 try:
                     self.chunk_gated_delta_rule(
