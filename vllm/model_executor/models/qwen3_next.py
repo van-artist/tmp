@@ -921,8 +921,28 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     cu_seqlens=None,
                     use_qk_l2norm_in_kernel=False,
                 )
+                # The production B=1 path addresses the persistent SSM cache
+                # through a device-side slot index.  It is a distinct Triton
+                # specialization, so compile it while profiling memory is
+                # still available rather than on the first real request.
+                indexed_warmup_state = state.clone()
+                fla_chunk_gated_delta_rule_into(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    out=direct_warmup_out,
+                    initial_state=None,
+                    output_final_state=True,
+                    cu_seqlens=None,
+                    use_qk_l2norm_in_kernel=False,
+                    state_cache=indexed_warmup_state,
+                    state_indices=dummy_state_indices,
+                    has_initial_state=dummy_has_initial,
+                )
                 torch.accelerator.synchronize()
-                del direct_warmup_out
+                del direct_warmup_out, indexed_warmup_state
 
             # Tune the fixed B=1 route used by the throughput test before the
             # general varlen route.  Several FLA autotune keys omit varlen/T,
@@ -1267,8 +1287,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # 2.2: Process the remaining part
         direct_prefill_out = False
         if attn_metadata.num_prefills > 0:
-            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
-            initial_state[~has_initial_state, ...] = 0
             # A single pure prefill is already represented as [B=1, T, ...].
             # Avoid rebuilding and reading the equivalent [0, T] variable-
             # length chunk metadata in every FLA kernel. Mixed/multi-request
@@ -1281,6 +1299,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             )
             direct_prefill_out = fused_prefill_prep and gdn_cu_seqlens is None
             if direct_prefill_out:
+                # Let the direct-output GDN kernel address vLLM's persistent
+                # state slot itself.  This removes the advanced-index gather,
+                # new-request zero-fill, temporary final state, and scatter
+                # back to the same cache slot in every GDN layer.
                 core_attn_out_non_spec, last_recurrent_state = (
                     fla_chunk_gated_delta_rule_into(
                         q=query_non_spec,
@@ -1289,14 +1311,21 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                         g=g_non_spec,
                         beta=beta_non_spec,
                         out=core_attn_out[:num_actual_tokens].unsqueeze(0),
-                        initial_state=initial_state,
+                        initial_state=None,
                         output_final_state=True,
                         cu_seqlens=None,
                         use_qk_l2norm_in_kernel=False,
                         g_is_cumulative=fused_prefill_cumsum,
+                        state_cache=ssm_state,
+                        state_indices=non_spec_state_indices_tensor,
+                        has_initial_state=has_initial_state,
                     )
                 )
             else:
+                initial_state = ssm_state[
+                    non_spec_state_indices_tensor
+                ].contiguous()
+                initial_state[~has_initial_state, ...] = 0
                 (
                     core_attn_out_non_spec,
                     last_recurrent_state,
@@ -1311,10 +1340,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     cu_seqlens=gdn_cu_seqlens,
                     use_qk_l2norm_in_kernel=not fused_prefill_prep,
                 )
-            # Init cache
-            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                ssm_state.dtype
-            )
+            if not direct_prefill_out:
+                # The direct route has already updated the indexed cache slot.
+                ssm_state[non_spec_state_indices_tensor] = (
+                    last_recurrent_state.to(ssm_state.dtype)
+                )
         elif attn_metadata.num_decodes > 0:
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(

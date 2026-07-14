@@ -49,6 +49,8 @@ def chunk_fused_h_o_kernel(
     o,
     h0,
     ht,
+    state_indices,
+    has_initial_state,
     # attention input
     q,
     scale,
@@ -62,6 +64,7 @@ def chunk_fused_h_o_kernel(
     USE_G: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
+    USE_INDEXED_STATE: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -99,24 +102,45 @@ def chunk_fused_h_o_kernel(
     stride_k = Hg * K
     stride_w = H * K
 
+    # The regular FLA interface passes a compact [N,H,V,K] state tensor.
+    # vLLM's fixed B=1 inference path already owns the persistent state cache
+    # and a device-side slot index.  Addressing that slot here avoids a
+    # gather, a zero-fill for new requests, a temporary final-state tensor,
+    # and the scatter back to the cache in every GDN layer.
+    if USE_INDEXED_STATE:
+        state_slot = tl.load(state_indices + i_n).to(tl.int64)
+        load_initial = tl.load(has_initial_state + i_n).to(tl.int1)
+        state_nh = state_slot * H + i_h
+    else:
+        load_initial = True
+        state_nh = i_nh
     if USE_INITIAL_STATE:
-        h0_p = h0 + i_nh * V * K
+        h0_p = h0 + state_nh * V * K
     if STORE_FINAL_STATE:
-        ht_p = ht + i_nh * V * K
+        ht_p = ht + state_nh * V * K
 
     # Load initial state
     if USE_INITIAL_STATE:
-        p_h0_1 = tl.make_block_ptr(h0_p, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
-        b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
-        if K > 64:
-            p_h0_2 = tl.make_block_ptr(h0_p, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0))
-            b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
-        if K > 128:
-            p_h0_3 = tl.make_block_ptr(h0_p, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0))
-            b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
-        if K > 192:
-            p_h0_4 = tl.make_block_ptr(h0_p, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0))
-            b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
+        if load_initial:
+            p_h0_1 = tl.make_block_ptr(
+                h0_p, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
+            )
+            b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
+            if K > 64:
+                p_h0_2 = tl.make_block_ptr(
+                    h0_p, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+                )
+                b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
+            if K > 128:
+                p_h0_3 = tl.make_block_ptr(
+                    h0_p, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
+                )
+                b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
+            if K > 192:
+                p_h0_4 = tl.make_block_ptr(
+                    h0_p, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
+                )
+                b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
 
     # Main recurrence: process one chunk per iteration.
     for i_t in range(NT):
@@ -277,6 +301,9 @@ def chunk_fused_fwd_h_o(
     initial_state: torch.Tensor | None,
     output_final_state: bool,
     out: torch.Tensor | None = None,
+    state_cache: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
     chunk_size: int = _FLA_CHUNK_SIZE,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Fused fwd_h + fwd_o for non-varlen path. Returns (o, final_state)."""
@@ -293,9 +320,41 @@ def chunk_fused_fwd_h_o(
         if out.shape != (B, T, H, V) or out.dtype != q.dtype:
             raise ValueError("fused GDN output buffer has an unexpected shape/dtype")
         o = out
-    final_state = (
-        k.new_empty(N, H, V, K, dtype=torch.float32) if output_final_state else None
-    )
+    use_indexed_state = state_cache is not None
+    if use_indexed_state:
+        if not output_final_state:
+            raise ValueError("indexed GDN state requires output_final_state=True")
+        if initial_state is not None:
+            raise ValueError(
+                "indexed GDN state and compact initial_state are exclusive"
+            )
+        if state_indices is None or has_initial_state is None:
+            raise ValueError(
+                "indexed GDN state requires indices and initial-state mask"
+            )
+        if state_cache.ndim != 4 or state_cache.shape[1:] != (H, V, K):
+            raise ValueError("GDN state cache has an unexpected shape")
+        if state_indices.shape != (N,) or has_initial_state.shape != (N,):
+            raise ValueError("indexed GDN state metadata has an unexpected shape")
+        if state_indices.dtype != torch.int32 or has_initial_state.dtype != torch.bool:
+            raise ValueError("indexed GDN state metadata has an unexpected dtype")
+        if not state_cache.is_contiguous():
+            raise ValueError("GDN state cache must be contiguous")
+        if not state_indices.is_contiguous() or not has_initial_state.is_contiguous():
+            raise ValueError("indexed GDN state metadata must be contiguous")
+        initial_state_ptr = state_cache
+        final_state_ptr = state_cache
+        # The persistent cache is updated in place; there is no private state
+        # tensor for the caller to scatter back.
+        final_state = None
+    else:
+        initial_state_ptr = initial_state
+        final_state = (
+            k.new_empty(N, H, V, K, dtype=torch.float32)
+            if output_final_state
+            else None
+        )
+        final_state_ptr = final_state
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
@@ -306,8 +365,10 @@ def chunk_fused_fwd_h_o(
         w=w,
         g=g,
         o=o,
-        h0=initial_state,
-        ht=final_state,
+        h0=initial_state_ptr,
+        ht=final_state_ptr,
+        state_indices=state_indices,
+        has_initial_state=has_initial_state,
         q=q,
         scale=scale,
         T=T,
@@ -317,6 +378,7 @@ def chunk_fused_fwd_h_o(
         V=V,
         BT=BT,
         BV=16,
+        USE_INDEXED_STATE=use_indexed_state,
         num_warps=2,
         num_stages=1,
         matrix_instr_nonkdim=16,

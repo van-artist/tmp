@@ -35,6 +35,9 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     out: torch.Tensor | None = None,
     g_is_cumulative: bool = False,
+    state_cache: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
 ):
     if not g_is_cumulative:
         g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
@@ -76,6 +79,9 @@ def chunk_gated_delta_rule_fwd(
             initial_state=initial_state,
             output_final_state=output_final_state,
             out=out,
+            state_cache=state_cache,
+            state_indices=state_indices,
+            has_initial_state=has_initial_state,
         )
         return g, output, A, final_state, None, None, None
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
@@ -266,6 +272,9 @@ def chunk_gated_delta_rule_into(
     cu_seqlens: torch.LongTensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     g_is_cumulative: bool = False,
+    state_cache: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Inference-only GDN path that writes K6 output into ``out`` directly."""
     if q.dtype != k.dtype or q.dtype != v.dtype or q.dtype == torch.float32:
@@ -291,5 +300,8 @@ def chunk_gated_delta_rule_into(
         cu_seqlens=None,
         out=out,
         g_is_cumulative=g_is_cumulative,
+        state_cache=state_cache,
+        state_indices=state_indices,
+        has_initial_state=has_initial_state,
     )
     return output, final_state
