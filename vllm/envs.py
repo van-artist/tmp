@@ -113,6 +113,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_GFX936_AITER_GEMV: bool = True
+    VLLM_ROCM_USE_GFX936_FUSED_SWIGLU: bool = True
     VLLM_ROCM_PREFIX_PREFILL_TILE_M: int = 64
     VLLM_ROCM_PREFIX_PREFILL_TILE_N: int = 32
     VLLM_ROCM_PREFIX_PREFILL_NUM_WARPS: int = 4
@@ -986,6 +987,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Exact-shape, BF16 decode GEMV kernels tuned for gfx936.
     "VLLM_ROCM_USE_GFX936_AITER_GEMV": lambda: (
         os.getenv("VLLM_ROCM_USE_GFX936_AITER_GEMV", "True").lower()
+        in ("true", "1")
+    ),
+    # Fuse the exact Qwen3.5-27B decode gate/up projection with SwiGLU.
+    "VLLM_ROCM_USE_GFX936_FUSED_SWIGLU": lambda: (
+        os.getenv("VLLM_ROCM_USE_GFX936_FUSED_SWIGLU", "True").lower()
         in ("true", "1")
     ),
     # Query/key tiles for the dense ROCm prefix-prefill kernel. These do not

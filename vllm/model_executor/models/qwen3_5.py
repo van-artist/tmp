@@ -31,6 +31,7 @@ import torch
 from einops import rearrange
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     VllmConfig,
@@ -39,11 +40,18 @@ from vllm.distributed import (
     get_pp_group,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.model_executor.layers.fla.ops import rmsnorm_gated_strided_z_inplace
+from vllm.model_executor.layers.fused_swiglu import (  # noqa: F401
+    qwen35_fused_gate_up_swiglu_impl,
+)
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3_5RMSNorm,
 )
-from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
@@ -61,6 +69,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_5 import (
     Qwen3_5Config,
@@ -120,6 +129,63 @@ class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
 class Qwen3_5MoeProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3_5MoeConfig)
+
+
+class Qwen3_5MLP(Qwen3NextMLP):
+    """Dense Qwen3.5 MLP with an exact gfx936 decode-only SwiGLU path."""
+
+    def _can_fuse_gate_up_swiglu(
+        self,
+        x: torch.Tensor,
+    ) -> bool:
+        if (
+            not envs.VLLM_ROCM_USE_GFX936_FUSED_SWIGLU
+            or not current_platform.is_rocm()
+        ):
+            return False
+
+        from vllm.platforms.rocm import on_gfx936
+
+        return (
+            on_gfx936()
+            and self.gate_up_proj.tp_size == 1
+            and not self.gate_up_proj.gather_output
+            and self.down_proj.tp_size == 1
+            and self.down_proj.input_is_parallel
+            and self.down_proj.reduce_results
+            and isinstance(
+                self.gate_up_proj.quant_method, UnquantizedLinearMethod
+            )
+            and isinstance(self.down_proj.quant_method, UnquantizedLinearMethod)
+            and self.gate_up_proj.bias is None
+            and self.down_proj.bias is None
+            and not vllm_is_batch_invariant()
+            and not torch.is_grad_enabled()
+            and x.shape == (1, 5120)
+            and self.gate_up_proj.weight.shape == (34816, 5120)
+            and x.dtype == torch.bfloat16
+            and self.gate_up_proj.weight.dtype == torch.bfloat16
+            and x.is_cuda
+            and self.gate_up_proj.weight.is_cuda
+            and x.device == self.gate_up_proj.weight.device
+            and x.is_contiguous()
+            and self.gate_up_proj.weight.is_contiguous()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._can_fuse_gate_up_swiglu(x):
+            out = torch.ops.vllm.qwen35_fused_gate_up_swiglu(
+                x, self.gate_up_proj.weight
+            )
+            out, _ = self.down_proj(out)
+            return out
+
+        gate_up, _ = self.gate_up_proj(x)
+        out = self.act_fn(gate_up)
+        out, _ = self.down_proj(out)
+        if self.expert_gate is not None:
+            out = torch.nn.functional.sigmoid(self.expert_gate(x)[0]) * out
+        return out
 
 
 class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
@@ -282,7 +348,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 prefix=f"{prefix}.mlp",
             )
         elif config.model_type == "qwen3_5_text":
-            self.mlp = Qwen3NextMLP(
+            self.mlp = Qwen3_5MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
