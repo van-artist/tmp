@@ -41,6 +41,7 @@ logger = init_logger(__name__)
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+QWEN35_GFX936_SOFTMAX_SEGMENTS = 128
 
 
 @dataclass
@@ -174,7 +175,32 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 key=lambda x: abs(x - self.seq_threshold_3D),
             )
 
-        self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
+        # A single Qwen3.5 request exposes only four KV-head programs.
+        # Reserve the measured maximum of 128 independent sequence segments.
+        # The kernel uses 128 through 24K and the first 64 beyond that point;
+        # preserve the upstream grouping for every other model and geometry.
+        qwen35_gfx936_segments = (
+            current_platform.is_rocm()
+            and getattr(model_config, "architecture", None)
+            in (
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            )
+            and self.block_size == 784
+            and self.num_heads_q == 24
+            and self.num_heads_kv == 4
+            and self.headdim == 256
+            and kv_cache_spec.dtype == torch.bfloat16
+        )
+        if qwen35_gfx936_segments:
+            from vllm.platforms.rocm import on_gfx936
+
+            qwen35_gfx936_segments = on_gfx936()
+        self.num_par_softmax_segments = (
+            QWEN35_GFX936_SOFTMAX_SEGMENTS
+            if qwen35_gfx936_segments
+            else NUM_PAR_SOFTMAX_SEGMENTS
+        )
         headdim_padded = next_power_of_2(self.headdim)
         self.softmax_segm_output = torch.empty(
             (

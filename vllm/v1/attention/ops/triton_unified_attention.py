@@ -20,7 +20,6 @@ logger = init_logger(__name__)
 is_batch_invariant = vllm_is_batch_invariant()
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
-
 def _qwen35_prefill_tuning(name: str, default: int, allowed: tuple[int, ...]) -> int:
     """Read a guarded exact-shape ROCm tuning override.
 
@@ -491,6 +490,7 @@ def kernel_unified_attention_3d(
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
+    SEGMENT_BUFFER_STRIDE: tl.constexpr,  # allocated segment dimension
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
@@ -518,7 +518,8 @@ def kernel_unified_attention_3d(
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
 
-    # number of segments for this particular sequence
+    # Number of active segments may be smaller than the allocated segment
+    # dimension. Pointer arithmetic always uses SEGMENT_BUFFER_STRIDE.
     num_segments = NUM_SEGMENTS_PER_SEQ
     tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
 
@@ -807,8 +808,8 @@ def kernel_unified_attention_3d(
 
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-        + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        * (num_query_heads * SEGMENT_BUFFER_STRIDE * HEAD_SIZE_PADDED)
+        + query_offset_1[:, None] * (SEGMENT_BUFFER_STRIDE * HEAD_SIZE_PADDED)
         + segm_idx * HEAD_SIZE_PADDED
         + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
     )
@@ -818,8 +819,8 @@ def kernel_unified_attention_3d(
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
     )
     segm_offset = (
-        query_offset_0.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-        + query_offset_1 * NUM_SEGMENTS_PER_SEQ
+        query_offset_0.to(tl.int64) * (num_query_heads * SEGMENT_BUFFER_STRIDE)
+        + query_offset_1 * SEGMENT_BUFFER_STRIDE
         + segm_idx
     )
     tl.store(segm_max_ptr + segm_offset, M, mask=query_mask_0 & query_mask_1)
@@ -846,6 +847,7 @@ def reduce_segments(
     query_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
+    SEGMENT_BUFFER_STRIDE: tl.constexpr,  # allocated segment dimension
     USE_FP8: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
@@ -873,8 +875,8 @@ def reduce_segments(
 
     # load segment maxima
     segm_offset = (
-        query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-        + query_head_idx * NUM_SEGMENTS_PER_SEQ
+        query_token_idx.to(tl.int64) * (num_query_heads * SEGMENT_BUFFER_STRIDE)
+        + query_head_idx * SEGMENT_BUFFER_STRIDE
         + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
     )
     segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
@@ -888,8 +890,8 @@ def reduce_segments(
     # load, rescale, and add segment attention outputs
     segm_output_offset = (
         query_token_idx.to(tl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        * (num_query_heads * SEGMENT_BUFFER_STRIDE * HEAD_SIZE_PADDED)
+        + query_head_idx * (SEGMENT_BUFFER_STRIDE * HEAD_SIZE_PADDED)
         + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED
         + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
     )
@@ -1085,6 +1087,36 @@ def unified_attention(
     else:
         qwen35_launch_config = {}
 
+    qwen35_decode_launch_config = {}
+    segment_buffer_stride = num_par_softmax_segments
+    if (
+        max_seqlen_q == 1
+        and current_platform.is_rocm()
+        and block_size == 784
+        and num_query_heads == 24
+        and num_kv_heads == 4
+        and head_size == 256
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and v.dtype == torch.bfloat16
+        and window_size == (-1, -1)
+        and softcap == 0.0
+        and sinks is None
+        and alibi_slopes is None
+        and qq_bias is None
+        and mm_prefix_range is None
+        and num_par_softmax_segments == 128
+    ):
+        # The metadata owns one 128-segment allocation. Select the measured
+        # active grid from max_seqlen_k while retaining 128 as the storage
+        # stride, so the 64-way path uses only the allocation's first half.
+        num_par_softmax_segments = 128 if max_seqlen_k <= 24576 else 64
+        qwen35_decode_launch_config = {
+            "num_warps": 2,
+            "num_stages": 1,
+            "waves_per_eu": 1,
+        }
+
     # Launch the 2D kernel if
     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
     # 2. The batch includes at least one prefill request, or
@@ -1207,6 +1239,8 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
+            SEGMENT_BUFFER_STRIDE=segment_buffer_stride,
+            **qwen35_decode_launch_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
@@ -1226,5 +1260,6 @@ def unified_attention(
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
+            SEGMENT_BUFFER_STRIDE=segment_buffer_stride,
             USE_FP8=output_scale is not None,
         )
