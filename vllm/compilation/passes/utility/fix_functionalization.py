@@ -123,6 +123,21 @@ class FixFunctionalizationPass(VllmInductorPass):
                 mutated_args = {1: "dst"}
                 self.defunctionalize(graph, node, mutated_args)
             elif (
+                hasattr(torch.ops.vllm, "qwen35_gateup_int8_apply")
+                and at_target
+                == torch.ops.vllm.qwen35_gateup_int8_apply.default
+            ):
+                # Preserve the three concrete work-buffer mutations.  In
+                # particular, functionalizing the shared 340 MiB BF16 scratch
+                # would add a full-tensor clone/copy around every selected
+                # prefill layer and erase the weight-only INT8 benefit.
+                mutated_args = {
+                    1: "input_pad",
+                    2: "input_scale",
+                    3: "scratch",
+                }
+                self.defunctionalize(graph, node, mutated_args)
+            elif (
                 hasattr(torch.ops.vllm, "flashinfer_trtllm_fused_allreduce_norm")
                 and at_target
                 == torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm.default

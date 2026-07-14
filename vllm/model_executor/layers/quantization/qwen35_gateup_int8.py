@@ -313,6 +313,58 @@ direct_register_custom_op(
 )
 
 
+def _qwen35_gateup_int8_apply(
+    x: torch.Tensor,
+    qweight_row: torch.Tensor,
+    qweight_kn: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_pad: torch.Tensor,
+    input_scale: torch.Tensor,
+    scratch: torch.Tensor,
+) -> torch.Tensor:
+    """Run phase-specific gate/up code behind one opaque graph node.
+
+    Dynamo sees the whole model with a symbolic token dimension.  Keeping the
+    M==1 dispatch in ordinary Python made the first prefill trace specialize
+    the decode graph to the 340 MiB weight-dequantization path.  A custom op is
+    opaque to Dynamo, while this implementation receives the concrete replay
+    shape and can select the intended kernel sequence.
+    """
+    x_2d = x.reshape(-1, _QWEN35_GATEUP_K)
+    if x_2d.shape[0] == 1:
+        _qwen35_gateup_quant_input(x_2d, input_pad, input_scale)
+        accum = torch._int_mm(input_pad, qweight_kn)
+        output = _qwen35_gateup_dequant_output(
+            accum,
+            input_scale,
+            weight_scale,
+        )
+    else:
+        _qwen35_gateup_dequant_weight(qweight_row, weight_scale, scratch)
+        output = F.linear(x_2d, scratch)
+    return output.reshape(*x.shape[:-1], _QWEN35_GATEUP_N)
+
+
+def _qwen35_gateup_int8_apply_fake(
+    x: torch.Tensor,
+    qweight_row: torch.Tensor,
+    qweight_kn: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_pad: torch.Tensor,
+    input_scale: torch.Tensor,
+    scratch: torch.Tensor,
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], _QWEN35_GATEUP_N))
+
+
+direct_register_custom_op(
+    op_name="qwen35_gateup_int8_apply",
+    op_func=_qwen35_gateup_int8_apply,
+    mutates_args=["input_pad", "input_scale", "scratch"],
+    fake_impl=_qwen35_gateup_int8_apply_fake,
+)
+
+
 def _shared_scratch(weight: torch.Tensor) -> torch.Tensor:
     key = (
         _device_index(weight),
@@ -408,30 +460,12 @@ def apply_qwen35_gateup_int8(
             "Qwen3.5 gate_up INT8 received an unexpected input shape/dtype"
         )
 
-    x_2d = x.reshape(-1, _QWEN35_GATEUP_K)
-    if x_2d.shape[0] == 1:
-        torch.ops.vllm.qwen35_gateup_quant_input(
-            x_2d,
-            layer.qwen35_gateup_input_pad,
-            layer.qwen35_gateup_input_scale,
-        )
-        accum = torch._int_mm(
-            layer.qwen35_gateup_input_pad,
-            layer.qwen35_gateup_qweight_kn,
-        )
-        output = torch.ops.vllm.qwen35_gateup_dequant_output(
-            accum,
-            layer.qwen35_gateup_input_scale,
-            layer.qwen35_gateup_weight_scale,
-        )
-    else:
-        # Mutation is explicit in the custom-op schema.  The following linear
-        # read therefore cannot be reordered after the next layer's overwrite.
-        torch.ops.vllm.qwen35_gateup_dequant_weight(
-            layer.qwen35_gateup_qweight_row,
-            layer.qwen35_gateup_weight_scale,
-            layer.qwen35_gateup_shared_scratch,
-        )
-        output = F.linear(x_2d, layer.qwen35_gateup_shared_scratch)
-
-    return output.reshape(*x.shape[:-1], _QWEN35_GATEUP_N)
+    return torch.ops.vllm.qwen35_gateup_int8_apply(
+        x,
+        layer.qwen35_gateup_qweight_row,
+        layer.qwen35_gateup_qweight_kn,
+        layer.qwen35_gateup_weight_scale,
+        layer.qwen35_gateup_input_pad,
+        layer.qwen35_gateup_input_scale,
+        layer.qwen35_gateup_shared_scratch,
+    )
