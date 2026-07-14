@@ -713,9 +713,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
-        # Note: we should not use torch.empty here like other attention backends,
-        # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        core_attn_out = torch.zeros(
+        # Every real row is overwritten by the core kernel.  The core also
+        # explicitly clears scheduler padding on all supported paths, so a
+        # full-buffer memset here only adds 48 MiB of writes per 4096-token
+        # Qwen3.5 GDN layer.
+        core_attn_out = torch.empty(
             (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
