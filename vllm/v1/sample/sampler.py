@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config.model import LogprobsMode
+from vllm.platforms import current_platform
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -63,6 +64,11 @@ class Sampler(nn.Module):
         self.topk_topp_sampler = TopKTopPSampler(logprobs_mode)
         self.pin_memory = is_pin_memory_available()
         self.logprobs_mode = logprobs_mode
+        self.use_bf16_greedy = False
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx936
+
+            self.use_bf16_greedy = on_gfx936()
 
     def forward(
         self,
@@ -77,6 +83,32 @@ class Sampler(nn.Module):
         # This is different from the V0 sampler, which uses the logits that
         # is used for sampling (after penalties and temperature scaling).
         num_logprobs = sampling_metadata.max_num_logprobs
+
+        # Qwen3.5 evaluation requests are plain greedy sampling. Avoid the
+        # otherwise redundant BF16 -> FP32 logits materialization for this
+        # strict, processor-free case. All feature-bearing paths below retain
+        # the original FP32 processing order.
+        if (
+            self.use_bf16_greedy
+            and logits.dtype == torch.bfloat16
+            and logits.is_cuda
+            and logits.ndim == 2
+            and logits.is_contiguous()
+            and logits.shape[1] % 16 == 0
+            and sampling_metadata.all_greedy
+            and not sampling_metadata.all_random
+            and num_logprobs is None
+            and sampling_metadata.no_penalties
+            and sampling_metadata.allowed_token_ids_mask is None
+            and not sampling_metadata.bad_words_token_ids
+            and not sampling_metadata.logitsprocs.non_argmax_invariant
+        ):
+            sampled = self.greedy_sample(logits).to(torch.int32)
+            return SamplerOutput(
+                sampled_token_ids=sampled.unsqueeze(-1),
+                logprobs_tensors=None,
+            )
+
         if num_logprobs is not None:
             if logprobs_mode == "raw_logprobs":
                 raw_logprobs = self.compute_logprobs(logits)
