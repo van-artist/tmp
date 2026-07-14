@@ -99,7 +99,7 @@ def qwen35_bf16_gateup_silu_impl(
         x_2d = x.reshape(1, _QWEN35_HIDDEN_SIZE)
         output = x.new_empty((1, _QWEN35_INTERMEDIATE_SIZE))
         _qwen35_bf16_gateup_silu_kernel[
-            (triton.cdiv(_QWEN35_INTERMEDIATE_SIZE, 16),)
+            (triton.cdiv(_QWEN35_INTERMEDIATE_SIZE, 32),)
         ](
             x_2d,
             weight,
@@ -107,9 +107,9 @@ def qwen35_bf16_gateup_silu_impl(
             K=_QWEN35_HIDDEN_SIZE,
             D=_QWEN35_INTERMEDIATE_SIZE,
             BLOCK_M=16,
-            BLOCK_D=16,
+            BLOCK_D=32,
             BLOCK_K=512,
-            num_warps=4,
+            num_warps=2,
             num_stages=1,
             waves_per_eu=1,
             matrix_instr_nonkdim=16,
