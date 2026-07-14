@@ -54,8 +54,12 @@ def _conv_silu_bf16_tile(
             mask=source_tokens >= 0,
             other=0.0,
         )
-        state_columns = tl.maximum(
-            0, tl.minimum(WIDTH - 2, source_tokens + WIDTH - 1)
+        # Only negative ``source_tokens`` consume state; for those lanes the
+        # exact cache column is source_tokens + WIDTH - 1 in [0, WIDTH-2].
+        # Keep masked non-negative lanes on a safe in-bounds address without
+        # the HCU backend's unsupported scalar min/max lowering at BLOCK_T=16.
+        state_columns = tl.where(
+            source_tokens < 0, source_tokens + WIDTH - 1, 0
         )
         from_state = tl.load(
             state_ptr
