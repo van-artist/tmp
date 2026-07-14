@@ -558,7 +558,11 @@ def kernel_unified_attention_3d(
     )
 
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
-    query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
+    # A power-of-two BLOCK_M is not necessarily divisible by the GQA ratio
+    # (Qwen3.5 uses 6). Do not let padded rows spill into the next query block
+    # and race its partial-output stores.
+    valid_m = offs_m < BLOCK_Q * num_queries_per_kv
+    query_mask_0 = ((query_pos < cur_batch_query_len) & valid_m).to(tl.int1)
     query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
@@ -649,30 +653,47 @@ def kernel_unified_attention_3d(
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
 
-        if BLOCK_SIZE == 784 and TILE_SIZE == 16:
-            # Qwen3.5 uses 784-token pages.  Since 784 == 49 * 16, a
-            # 16-token decode tile can never cross a page boundary.  Load the
-            # page-table entry once for the whole tile instead of once per
-            # lane, and derive each lane's in-page offset from the tile start.
-            tile_seq_offset = j * TILE_SIZE
-            page_idx = tile_seq_offset // BLOCK_SIZE
-            in_page_offset = tile_seq_offset - page_idx * BLOCK_SIZE + offs_t
-            physical_block_idx = tl.load(
-                block_tables_ptr + block_table_offset + page_idx
+        if BLOCK_SIZE == 784 and (
+            TILE_SIZE == 16 or TILE_SIZE == 32 or TILE_SIZE == 64
+        ):
+            # Match the 2D Qwen path: one scalar page calculation and at most
+            # two page-table loads for a tile that straddles a 784-token page.
+            tile_token_start = j * TILE_SIZE
+            page_idx = tile_token_start // BLOCK_SIZE
+            page_offset = tile_token_start - page_idx * BLOCK_SIZE
+            crosses_page = offs_t >= BLOCK_SIZE - page_offset
+            internal_offset = (
+                page_offset
+                + offs_t
+                - crosses_page.to(tl.int32) * BLOCK_SIZE
+            )
+            block_table_ptr = block_tables_ptr + block_table_offset + page_idx
+            first_page = tl.load(block_table_ptr).to(tl.int64)
+            next_page_is_used = (
+                (page_offset + TILE_SIZE > BLOCK_SIZE)
+                & (max_seq_prefix_len > tile_token_start + BLOCK_SIZE - page_offset)
+            )
+            next_page = tl.load(
+                block_table_ptr + 1,
+                mask=next_page_is_used,
+                other=0,
             ).to(tl.int64)
+            physical_block_idx = tl.where(
+                crosses_page, next_page, first_page
+            )
 
             v_offset = (
-                physical_block_idx * stride_v_cache_0
+                physical_block_idx[:, None] * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_2
                 + offs_d[None, :] * stride_v_cache_3
-                + in_page_offset[:, None] * stride_v_cache_1
+                + internal_offset[:, None] * stride_v_cache_1
             )
 
             k_offset = (
-                physical_block_idx * stride_k_cache_0
+                physical_block_idx[None, :] * stride_k_cache_0
                 + kv_head_idx * stride_k_cache_2
                 + offs_d[:, None] * stride_k_cache_3
-                + in_page_offset[None, :] * stride_k_cache_1
+                + internal_offset[None, :] * stride_k_cache_1
             )
         else:
             physical_block_idx = tl.load(
@@ -999,6 +1020,7 @@ def unified_attention(
     use_alibi_sqrt=False,
     gfx936_qwen35_prefill=False,
     gfx936_delay_v_load=None,
+    gfx936_force_prefill_3d=False,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -1070,6 +1092,13 @@ def unified_attention(
                 )
             )
         )
+        if gfx936_force_prefill_3d:
+            assert num_par_softmax_segments is not None
+            assert softmax_segm_output is not None
+            assert softmax_segm_max is not None
+            assert softmax_segm_expsum is not None
+            assert softmax_segm_output.shape[0] >= q.shape[0]
+            assert softmax_segm_output.shape[2] >= num_par_softmax_segments
     else:
         BLOCK_M = (
             16
@@ -1126,7 +1155,7 @@ def unified_attention(
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
+        or (max_seqlen_q > 1 and not gfx936_force_prefill_3d)
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     ):
@@ -1188,6 +1217,14 @@ def unified_attention(
             **qwen35_launch_config,
         )
     else:
+        tile_size_3d = (
+            TILE_SIZE_PREFILL
+            if gfx936_force_prefill_3d
+            else TILE_SIZE_DECODE
+        )
+        launch_config_3d = (
+            qwen35_launch_config if gfx936_force_prefill_3d else {}
+        )
         kernel_unified_attention_3d[
             (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
         ](
@@ -1213,7 +1250,7 @@ def unified_attention(
             query_stride_1=q.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
-            TILE_SIZE=TILE_SIZE_DECODE,
+            TILE_SIZE=tile_size_3d,
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             USE_ALIBI_SLOPES=use_alibi_slopes,
@@ -1238,6 +1275,7 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
+            **launch_config_3d,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
@@ -1251,7 +1289,7 @@ def unified_attention(
             output_stride_0=out.stride(0),
             output_stride_1=out.stride(1),
             block_table_stride=block_table.stride(0),
-            TILE_SIZE=TILE_SIZE_DECODE,
+            TILE_SIZE=tile_size_3d,
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             query_start_len_ptr=cu_seqlens_q,
