@@ -168,8 +168,7 @@ def rmsnorm_gated_strided_z_inplace(
             BLOCK_H=block_h,
             BLOCK_D=block_d,
             num_warps=8,
-            num_stages=1,
-            waves_per_eu=1,
+            num_stages=2,
         )
         return x
 
