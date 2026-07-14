@@ -17,6 +17,7 @@ from .chunk_o import chunk_fwd_o
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
 from .l2norm import l2norm_fwd
+from .solve_recompute_fused import can_use_fused, solve_recompute_fused
 from .solve_tril import solve_tril
 from .utils import SUPPRESS_LEVEL, input_guard
 from .wy_fast import recompute_w_u_fwd
@@ -33,21 +34,37 @@ def chunk_gated_delta_rule_fwd(
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
     out: torch.Tensor | None = None,
+    g_is_cumulative: bool = False,
 ):
-    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+    if not g_is_cumulative:
+        g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
         k=k, beta=beta, g=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
     )
-    A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g_cumsum=g,
-        cu_seqlens=cu_seqlens,
+    # This specialization is inference-only.  ``chunk_gated_delta_rule_into``
+    # discards the private A return slot; every public/autograd/varlen call
+    # continues to materialize the solved A tensor in the fallback below.
+    use_fused_solve_recompute = (
+        out is not None
+        and cu_seqlens is None
+        and q.shape == (1, 4096, 16, 128)
+        and out.shape == v.shape
+        and can_use_fused(k=k, v=v, beta=beta, g=g, A=A)
     )
+    if use_fused_solve_recompute:
+        w, u = solve_recompute_fused(A=A, k=k, v=v, beta=beta, g=g)
+        A = None
+    else:
+        A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
+        w, u = recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            g_cumsum=g,
+            cu_seqlens=cu_seqlens,
+        )
     if out is not None and cu_seqlens is None:
         output, final_state = chunk_fused_fwd_h_o(
             k=k,
@@ -248,6 +265,7 @@ def chunk_gated_delta_rule_into(
     output_final_state: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    g_is_cumulative: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Inference-only GDN path that writes K6 output into ``out`` directly."""
     if q.dtype != k.dtype or q.dtype != v.dtype or q.dtype == torch.float32:
@@ -272,5 +290,6 @@ def chunk_gated_delta_rule_into(
         output_final_state=output_final_state,
         cu_seqlens=None,
         out=out,
+        g_is_cumulative=g_is_cumulative,
     )
     return output, final_state

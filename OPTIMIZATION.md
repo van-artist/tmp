@@ -89,6 +89,34 @@ guards. Unsupported shapes and environments retain the upstream path.
    no penalties, masks, bad words or non-argmax-invariant processors go
    directly to `argmax`. This avoids a redundant full-vocabulary FP32 copy.
    Every feature-bearing sampling path retains the original FP32 processing.
+12. **Exact GDN gate preparation plus local cumsum.** For one 4096-token
+   Qwen3.5 BF16 sequence, the post-convolution preparation kernel gives each
+   gate program one complete 64-token recurrent chunk and writes cumulative
+   FP32 decay directly. This removes the separate local-cumsum launch and its
+   HBM round trip while preserving Q/K/V, beta and cumulative gate bit for
+   bit. A shared predicate covers gfx936, model geometry, dtype, device,
+   layout and the single-sequence boundary; multi-request and varlen batches
+   retain the original cumsum.
+13. **Exact GDN triangular solve plus W/U recomputation.** The guarded direct
+   4096-token inference route solves each 64x64 lower-triangular block and
+   immediately emits W/U from the ten 16x16 inverse blocks. It explicitly
+   recreates the original BF16 RTNE inverse boundary, so W/U, attention output
+   and recurrent state are bitwise identical while removing one launch and
+   the solved inverse tensor's store/reload. Public, autograd, varlen and
+   non-direct-output paths remain unchanged.
+14. **Per-shape BF16 prefill BLAS selection.** Only the exact
+   `[4096,5120] @ [34816,5120]` gate/up projection selects hipBLASLt, which is
+   faster and bitwise identical on gfx936. The caller's prior backend is saved
+   and restored, and batch-invariant execution disables this specialization;
+   all other projections retain their measured faster backend.
+15. **Exact causal-convolution plus GDN preparation.** The single-sequence
+   4096-token gfx936 route computes the width-4 SiLU convolution directly into
+   raw BF16 Q/K, V, beta and cumulative gate outputs, updates the original
+   convolution cache, then normalizes Q/K in a small second kernel. It retains
+   the original BF16 convolution store/load boundary and is bitwise identical
+   with and without an initial state. Platform, sequence count, geometry,
+   activation, bias, cache layout, dtype and stride guards preserve the mature
+   convolution path for every other case.
 
 ## Validation and screening evidence
 
@@ -134,6 +162,18 @@ GovReport 39.79, retrieval-multi-point 100.00 and keyword-aggregation 100.00.
 This verifies all four accuracy routes and output parsing; the official full
 hidden-set evaluation remains authoritative.
 
+The new exact 4096-token gate+cumsum path reduced its isolated preparation
+from about 0.3859 to 0.3683 ms (1.048x). The exact fused triangular
+solve/recompute reduced that pair from 0.5954 to 0.5272 ms and the complete
+GDN recurrent core from 1.8486 to 1.7822 ms (3.59%). The shape-local
+hipBLASLt gate/up call, including backend selection and restoration, reduced
+the isolated projection from about 4.4359 to 4.4149 ms. All three comparisons
+were run on the target gfx936 and passed bitwise output/state checks.
+
+The exact convolution/preparation pair reduced 0.5737 to 0.5484 ms per GDN
+layer (4.60%) and matched Q/K/V/g/beta plus the complete convolution cache bit
+for bit for both initial-state modes.
+
 ## Rejected experiments
 
 - Changing the physical KV page: rejected because page geometry is a locked
@@ -152,6 +192,16 @@ hidden-set evaluation remains authoritative.
   long-context runs and/or changed generations.
 - Global hipBLASLt preference and AITER for down/out/BA/lm_head: measured
   regressions; lm_head also failed the numerical gate.
+- Fusing KKT construction into the new solve/recompute kernel: splitting one
+  efficient 64x64 dot into ten 16x16 dots made the complete recurrent core
+  about 7.2% slower and introduced sparse rounding changes, so the exact
+  two-stage KKT plus fused-solve design is retained.
+- A custom 4096-token gate/up GEMM plus SwiGLU kernel: despite avoiding the
+  activation intermediate, it was roughly three times slower than the tuned
+  BLAS GEMM plus activation and was rejected.
+- FlashAttention 3, direct AITER MHA and the installed Triton varlen-attention
+  alternative: unsupported or incompatible in the supplied software stack.
+  The measured dense ROCm FlashAttention 2 continuation path remains fastest.
 - Persistent gate/up INT8, persistent lm-head quantization and load-time
   reusable low-precision weight copies: rejected as outside the permitted
   optimization scope. This branch contains none of these paths.
