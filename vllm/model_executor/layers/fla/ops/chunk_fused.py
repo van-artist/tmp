@@ -55,6 +55,7 @@ def chunk_fused_h_o_kernel(
     q,
     scale,
     T,
+    state_stride_n,
     H: tl.constexpr,
     Hg: tl.constexpr,
     K: tl.constexpr,
@@ -110,14 +111,14 @@ def chunk_fused_h_o_kernel(
     if USE_INDEXED_STATE:
         state_slot = tl.load(state_indices + i_n).to(tl.int64)
         load_initial = tl.load(has_initial_state + i_n).to(tl.int1)
-        state_nh = state_slot * H + i_h
+        state_offset = state_slot * state_stride_n + i_h * V * K
     else:
         load_initial = True
-        state_nh = i_nh
+        state_offset = i_n.to(tl.int64) * state_stride_n + i_h * V * K
     if USE_INITIAL_STATE:
-        h0_p = h0 + state_nh * V * K
+        h0_p = h0 + state_offset
     if STORE_FINAL_STATE:
-        ht_p = ht + state_nh * V * K
+        ht_p = ht + state_offset
 
     # Load initial state
     if USE_INITIAL_STATE:
@@ -338,12 +339,19 @@ def chunk_fused_fwd_h_o(
             raise ValueError("indexed GDN state metadata has an unexpected shape")
         if state_indices.dtype != torch.int32 or has_initial_state.dtype != torch.bool:
             raise ValueError("indexed GDN state metadata has an unexpected dtype")
-        if not state_cache.is_contiguous():
-            raise ValueError("GDN state cache must be contiguous")
+        expected_inner_strides = (V * K, K, 1)
+        if state_cache.stride()[1:] != expected_inner_strides:
+            raise ValueError(
+                "GDN state cache must have a contiguous [H,V,K] layout "
+                "within each cache slot"
+            )
+        if state_cache.stride(0) < H * V * K:
+            raise ValueError("GDN state cache slots must not overlap")
         if not state_indices.is_contiguous() or not has_initial_state.is_contiguous():
             raise ValueError("indexed GDN state metadata must be contiguous")
         initial_state_ptr = state_cache
         final_state_ptr = state_cache
+        state_stride_n = state_cache.stride(0)
         # The persistent cache is updated in place; there is no private state
         # tensor for the caller to scatter back.
         final_state = None
@@ -355,6 +363,11 @@ def chunk_fused_fwd_h_o(
             else None
         )
         final_state_ptr = final_state
+        # Compact FLA states have the conventional contiguous [N,H,V,K]
+        # layout.  Keep that path unchanged for standalone calls and kernel
+        # microbenchmarks; only the indexed vLLM cache uses a padded slot
+        # stride.
+        state_stride_n = H * V * K
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
@@ -372,6 +385,7 @@ def chunk_fused_fwd_h_o(
         q=q,
         scale=scale,
         T=T,
+        state_stride_n=state_stride_n,
         H=H,
         Hg=Hg,
         K=K,
