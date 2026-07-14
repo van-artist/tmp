@@ -647,8 +647,15 @@ def unified_kv_cache_update(
     Returns a dummy that is passed to unified_attention to signal a side effect and
     the data dependency between them to ensure torch.compile preserves ordering.
     """
-    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
-    if layer_slot_mapping is not None:
+    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
+        layer_name
+    )
+    # The exact Qwen3.5 continuation route combines this update with dense K/V
+    # staging inside unified_attention_with_output. Keeping both mutations in
+    # that custom-op body makes their ordering explicit before FlashAttention.
+    if not getattr(attn_metadata, "gfx936_fused_kv_stage", False) and (
+        layer_slot_mapping is not None
+    ):
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
         )
@@ -694,7 +701,21 @@ def unified_attention_with_output(
     # that ensures torch.compile preserves ordering between KV cache update and
     # attention forward.
     del kv_cache_dummy_dep
-    attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
+    attn_metadata, self, kv_cache, layer_slot_mapping = get_attention_context(
+        layer_name
+    )
+
+    if getattr(attn_metadata, "gfx936_fused_kv_stage", False):
+        assert layer_slot_mapping is not None
+        assert hasattr(self.impl, "do_kv_cache_update_and_dense_stage")
+        self.impl.do_kv_cache_update_and_dense_stage(
+            self,
+            key,
+            value,
+            kv_cache,
+            layer_slot_mapping,
+            attn_metadata,
+        )
 
     self.impl.forward(
         self,

@@ -87,6 +87,9 @@ class TritonAttentionMetadata:
     gfx936_dense_key: torch.Tensor | None = None
     gfx936_dense_value: torch.Tensor | None = None
     gfx936_cu_seqlens_k: torch.Tensor | None = None
+    # Defer the ordinary update so the following opaque attention custom op
+    # prepares both the paged cache and complete dense continuation workspace.
+    gfx936_fused_kv_stage: bool = False
 
     @property
     def mm_prefix_range_tensor(self) -> torch.Tensor | None:
@@ -243,7 +246,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             and self.num_heads_q == 24
             and self.num_heads_kv == 4
             and self.headdim == 256
+            and model_config.dtype == torch.bfloat16
             and kv_cache_spec.dtype == torch.bfloat16
+            and vllm_config.parallel_config.tensor_parallel_size == 1
             and vllm_config.parallel_config.decode_context_parallel_size == 1
             and vllm_config.parallel_config.prefill_context_parallel_size == 1
             and vllm_config.speculative_config is None
@@ -279,6 +284,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         attn_metadata.gfx936_dense_key = None
         attn_metadata.gfx936_dense_value = None
         attn_metadata.gfx936_cu_seqlens_k = None
+        attn_metadata.gfx936_fused_kv_stage = False
         # When doing full graph capture, setting seq_lens to
         # max_model_len will cause graph capture to be extremely
         # slow, so here we set it to 1.
@@ -320,6 +326,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         gfx936_dense_key = None
         gfx936_dense_value = None
         gfx936_cu_seqlens_k = None
+        gfx936_fused_kv_stage = False
         if (
             self.gfx936_dense_key is not None
             and max_query_len > 1
@@ -336,6 +343,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             gfx936_dense_value = self.gfx936_dense_value[:max_seq_len]
             assert self.gfx936_cu_k_by_len is not None
             gfx936_cu_seqlens_k = self.gfx936_cu_k_by_len[max_seq_len]
+            gfx936_fused_kv_stage = True
 
         attn_metadata = TritonAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -359,6 +367,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             gfx936_dense_key=gfx936_dense_key,
             gfx936_dense_value=gfx936_dense_value,
             gfx936_cu_seqlens_k=gfx936_cu_seqlens_k,
+            gfx936_fused_kv_stage=gfx936_fused_kv_stage,
         )
         return attn_metadata
 
@@ -637,18 +646,19 @@ class TritonAttentionImpl(AttentionImpl):
             ):
                 from flash_attn import vllm_flash_attn_varlen_func
 
-                from vllm.v1.attention.ops.triton_qwen35_kv_gather import (
-                    gather_qwen35_paged_kv,
-                )
+                if not attn_metadata.gfx936_fused_kv_stage:
+                    from vllm.v1.attention.ops.triton_qwen35_kv_gather import (
+                        gather_qwen35_paged_kv,
+                    )
 
-                gather_qwen35_paged_kv(
-                    key_cache,
-                    value_cache,
-                    dense_key,
-                    dense_value,
-                    block_table,
-                    max_seqlen_k,
-                )
+                    gather_qwen35_paged_kv(
+                        key_cache,
+                        value_cache,
+                        dense_key,
+                        dense_value,
+                        block_table,
+                        max_seqlen_k,
+                    )
                 vllm_flash_attn_varlen_func(
                     query[:num_actual_tokens],
                     dense_key,
@@ -788,6 +798,67 @@ class TritonAttentionImpl(AttentionImpl):
             self.kv_cache_dtype,
             layer._k_scale,
             layer._v_scale,
+        )
+
+    def do_kv_cache_update_and_dense_stage(
+        self,
+        layer: AttentionLayer,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+    ) -> None:
+        """Prepare exact Qwen3.5 continuation cache and dense K/V together."""
+        del layer
+        dense_key = attn_metadata.gfx936_dense_key
+        dense_value = attn_metadata.gfx936_dense_value
+        assert attn_metadata.gfx936_fused_kv_stage
+        assert dense_key is not None and dense_value is not None
+        assert attn_metadata.gfx936_cu_seqlens_k is not None
+        assert current_platform.is_rocm()
+        from vllm.platforms.rocm import on_gfx936
+
+        assert on_gfx936()
+        assert self.attn_type == AttentionType.DECODER
+        assert self.kv_cache_dtype in ("auto", "bfloat16")
+        assert self.num_heads == 24
+        assert self.num_kv_heads == 4
+        assert self.head_size == 256
+        assert self.kv_sharing_target_layer_name is None
+        assert self.logits_soft_cap == 0
+        assert self.alibi_slopes is None
+        assert self.sinks is None
+        assert self.sliding_window == (-1, -1)
+        assert not self.use_alibi_sqrt
+        assert attn_metadata.max_query_len > 1
+        assert attn_metadata.num_actual_tokens == attn_metadata.max_query_len
+        assert attn_metadata.max_seq_len > attn_metadata.max_query_len
+        assert attn_metadata.query_start_loc.shape[0] == 2
+        assert attn_metadata.block_table.shape[0] == 1
+        assert not attn_metadata.use_cascade
+
+        key_cache, value_cache = kv_cache.unbind(1)
+        assert key_cache.dtype == torch.bfloat16
+        assert value_cache.dtype == torch.bfloat16
+        assert key_cache.shape[1:] == (784, 4, 256)
+        assert value_cache.shape[1:] == (784, 4, 256)
+
+        from vllm.v1.attention.ops.triton_qwen35_kv_gather import (
+            stage_qwen35_continuation_kv,
+        )
+
+        stage_qwen35_continuation_kv(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            dense_key,
+            dense_value,
+            attn_metadata.block_table,
+            slot_mapping,
+            attn_metadata.max_seq_len - attn_metadata.max_query_len,
+            attn_metadata.max_query_len,
         )
 
     def fused_rope_kvcache_supported(self):

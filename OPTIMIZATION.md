@@ -117,6 +117,17 @@ guards. Unsupported shapes and environments retain the upstream path.
    with and without an initial state. Platform, sequence count, geometry,
    activation, bias, cache layout, dtype and stride guards preserve the mature
    convolution path for every other case.
+16. **Fused continuation cache update plus dense staging.** For the exact
+   single-request BF16 continuation route, one page-major Triton launch copies
+   the old paged prefix into the existing dense workspace while loading each
+   current K/V row once and writing it to both the authoritative paged cache
+   and dense suffix. This replaces the prior cache-update plus full-gather
+   pair, removes the current chunk's cache readback and leaves the subsequent
+   FlashAttention call unchanged. The update is deferred into the same opaque
+   attention custom-op so cache, hidden scratch and attention stream ordering
+   are explicit. First chunks, decode, graph capture, FP8, multi-request,
+   cascade, cache sharing and every non-exact geometry retain the original
+   cache update and attention path.
 
 ## Validation and screening evidence
 
@@ -174,6 +185,14 @@ The exact convolution/preparation pair reduced 0.5737 to 0.5484 ms per GDN
 layer (4.60%) and matched Q/K/V/g/beta plus the complete convolution cache bit
 for bit for both initial-state modes.
 
+`benchmarks/kernels/benchmark_qwen35_continuation_stage.py` compares the new
+continuation launch against the original cache-update plus full-gather pair.
+It requires bitwise equality for the complete cache allocation and dense K/V,
+including shuffled physical pages, partial shared pages, padded slot mappings,
+the real strided V projection view and untouched sentinel regions. Target-GPU
+latency results are required before promoting this isolated branch to a final
+submission candidate.
+
 ## Rejected experiments
 
 - Changing the physical KV page: rejected because page geometry is a locked
@@ -217,6 +236,8 @@ for bit for both initial-state modes.
 - `vllm/v1/attention/backends/triton_attn.py`: phase-specific attention route
   and builder-owned dense scratch.
 - `vllm/v1/attention/ops/triton_qwen35_kv_gather.py`: exact paged K/V gather.
+- `benchmarks/kernels/benchmark_qwen35_continuation_stage.py`: fused staging
+  bitwise and latency screen.
 - `vllm/v1/attention/ops/triton_unified_attention.py`: guarded fallback tile.
 - `vllm/v1/sample/sampler.py`: processor-free BF16 greedy fast path.
 - `vllm/platforms/rocm.py`: isolated gfx936 predicate.
