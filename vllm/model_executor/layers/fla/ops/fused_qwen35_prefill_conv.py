@@ -43,15 +43,20 @@ def _conv_silu_bf16_tile(
     stride_state_dim: tl.constexpr,
     stride_state_tok: tl.constexpr,
     WIDTH: tl.constexpr,
+    T,
+    MASK_T: tl.constexpr,
 ):
     acc = tl.zeros(
         (token_offsets.shape[0], channel_offsets.shape[1]), dtype=tl.float32
     )
     for j in tl.static_range(0, WIDTH):
         source_tokens = token_offsets + j - (WIDTH - 1)
+        x_mask = source_tokens >= 0
+        if MASK_T:
+            x_mask &= source_tokens < T
         from_x = tl.load(
             x_ptr + source_tokens * stride_x_tok + channel_offsets,
-            mask=source_tokens >= 0,
+            mask=x_mask,
             other=0.0,
         )
         # Only negative ``source_tokens`` consume state; for those lanes the
@@ -148,6 +153,8 @@ def _conv_prep_cumsum_4096_kernel(
             stride_state_dim,
             stride_state_tok,
             WIDTH,
+            T,
+            False,
         )
         q_offsets = q_ptr + tokens * stride_q_tok + i_h * K + features
         if FUSE_QK_NORM:
@@ -179,6 +186,8 @@ def _conv_prep_cumsum_4096_kernel(
             stride_state_dim,
             stride_state_tok,
             WIDTH,
+            T,
+            False,
         )
         k_offsets = k_ptr + tokens * stride_k_tok + i_h * K + features
         if FUSE_QK_NORM:
@@ -244,6 +253,8 @@ def _conv_prep_cumsum_4096_kernel(
             stride_state_dim,
             stride_state_tok,
             WIDTH,
+            T,
+            False,
         )
         tl.store(v_ptr + tokens * stride_v_tok + i_hv * V + features, v_f32)
 
@@ -293,6 +304,237 @@ def _conv_prep_cumsum_4096_kernel(
         )
 
 
+@triton.jit(do_not_specialize=["T"])
+def _conv_prep_cumsum_tail_kernel(
+    x_ptr,
+    w_ptr,
+    state_ptr,
+    state_indices_ptr,
+    has_initial_ptr,
+    a_ptr,
+    b_ptr,
+    A_log_ptr,
+    dt_bias_ptr,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    g_ptr,
+    beta_ptr,
+    stride_x_tok: tl.constexpr,
+    stride_w_dim: tl.constexpr,
+    stride_w_width: tl.constexpr,
+    stride_state_seq: tl.constexpr,
+    stride_state_dim: tl.constexpr,
+    stride_state_tok: tl.constexpr,
+    stride_a_tok: tl.constexpr,
+    stride_b_tok: tl.constexpr,
+    stride_q_tok: tl.constexpr,
+    stride_k_tok: tl.constexpr,
+    stride_v_tok: tl.constexpr,
+    T,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    WIDTH: tl.constexpr,
+    QK_BLOCK_T: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    GATE_T: tl.constexpr,
+):
+    """Masked single-sequence tail specialization without shape JITs."""
+    pid = tl.program_id(0)
+    qk_nt = (T + QK_BLOCK_T - 1) // QK_BLOCK_T
+    nt = (T + BLOCK_T - 1) // BLOCK_T
+    ngt = (T + GATE_T - 1) // GATE_T
+    qk_tasks = H * qk_nt
+    value_tasks = HV * nt
+    cache_idx = tl.load(state_indices_ptr).to(tl.int64)
+    has_initial = tl.load(has_initial_ptr).to(tl.int1)
+
+    if pid < qk_tasks:
+        i_h = pid // qk_nt
+        i_tb = pid - i_h * qk_nt
+        tokens = i_tb * QK_BLOCK_T + tl.arange(0, QK_BLOCK_T)[:, None]
+        token_mask = tokens < T
+        features = tl.arange(0, K)[None, :]
+
+        q_channels = i_h * K + features
+        q_f32 = _conv_silu_bf16_tile(
+            x_ptr,
+            w_ptr,
+            state_ptr,
+            tokens,
+            q_channels,
+            cache_idx,
+            has_initial,
+            stride_x_tok,
+            stride_w_dim,
+            stride_w_width,
+            stride_state_seq,
+            stride_state_dim,
+            stride_state_tok,
+            WIDTH,
+            T,
+            True,
+        )
+        q_offsets = q_ptr + tokens * stride_q_tok + i_h * K + features
+        # Match production's convolution-output BF16 materialization before
+        # the feature reduction, including on a partially filled final tile.
+        tl.store(q_offsets, q_f32, mask=token_mask)
+        tl.debug_barrier()
+        q_f32 = tl.load(q_offsets, mask=token_mask, other=0.0).to(tl.float32)
+        q_f32 *= (
+            1.0 / tl.sqrt(tl.sum(q_f32 * q_f32, axis=1) + 1e-6)
+        )[:, None]
+        tl.store(q_offsets, q_f32, mask=token_mask)
+
+        k_channels = H * K + i_h * K + features
+        k_f32 = _conv_silu_bf16_tile(
+            x_ptr,
+            w_ptr,
+            state_ptr,
+            tokens,
+            k_channels,
+            cache_idx,
+            has_initial,
+            stride_x_tok,
+            stride_w_dim,
+            stride_w_width,
+            stride_state_seq,
+            stride_state_dim,
+            stride_state_tok,
+            WIDTH,
+            T,
+            True,
+        )
+        k_offsets = k_ptr + tokens * stride_k_tok + i_h * K + features
+        tl.store(k_offsets, k_f32, mask=token_mask)
+        tl.debug_barrier()
+        k_f32 = tl.load(k_offsets, mask=token_mask, other=0.0).to(tl.float32)
+        k_f32 *= (
+            1.0 / tl.sqrt(tl.sum(k_f32 * k_f32, axis=1) + 1e-6)
+        )[:, None]
+        tl.store(k_offsets, k_f32, mask=token_mask)
+
+        if i_tb == 0:
+            state_col = tl.arange(0, 4)[:, None]
+            state_mask = state_col < (WIDTH - 1)
+            last_tokens = T - (WIDTH - 1) + state_col
+            q_last = tl.load(
+                x_ptr + last_tokens * stride_x_tok + q_channels,
+                mask=state_mask,
+            )
+            k_last = tl.load(
+                x_ptr + last_tokens * stride_x_tok + k_channels,
+                mask=state_mask,
+            )
+            tl.store(
+                state_ptr
+                + cache_idx * stride_state_seq
+                + q_channels * stride_state_dim
+                + state_col * stride_state_tok,
+                q_last,
+                mask=state_mask,
+            )
+            tl.store(
+                state_ptr
+                + cache_idx * stride_state_seq
+                + k_channels * stride_state_dim
+                + state_col * stride_state_tok,
+                k_last,
+                mask=state_mask,
+            )
+
+    elif pid < qk_tasks + value_tasks:
+        local = pid - qk_tasks
+        i_hv = local // nt
+        i_tb = local - i_hv * nt
+        flat_tokens = i_tb * BLOCK_T + tl.arange(0, BLOCK_T)
+        token_mask = flat_tokens < T
+        tokens = flat_tokens[:, None]
+        features = tl.arange(0, V)[None, :]
+        v_channels = 2 * H * K + i_hv * V + features
+        v_f32 = _conv_silu_bf16_tile(
+            x_ptr,
+            w_ptr,
+            state_ptr,
+            tokens,
+            v_channels,
+            cache_idx,
+            has_initial,
+            stride_x_tok,
+            stride_w_dim,
+            stride_w_width,
+            stride_state_seq,
+            stride_state_dim,
+            stride_state_tok,
+            WIDTH,
+            T,
+            True,
+        )
+        tl.store(
+            v_ptr + tokens * stride_v_tok + i_hv * V + features,
+            v_f32,
+            mask=token_mask[:, None],
+        )
+
+        b_vals = tl.load(
+            b_ptr + flat_tokens * stride_b_tok + i_hv,
+            mask=token_mask,
+            other=0.0,
+        ).to(tl.float32)
+        tl.store(
+            beta_ptr + flat_tokens * HV + i_hv,
+            tl.sigmoid(b_vals),
+            mask=token_mask,
+        )
+
+        if i_tb == 0:
+            state_col = tl.arange(0, 4)[:, None]
+            state_mask = state_col < (WIDTH - 1)
+            last_tokens = T - (WIDTH - 1) + state_col
+            v_last = tl.load(
+                x_ptr + last_tokens * stride_x_tok + v_channels,
+                mask=state_mask,
+            )
+            tl.store(
+                state_ptr
+                + cache_idx * stride_state_seq
+                + v_channels * stride_state_dim
+                + state_col * stride_state_tok,
+                v_last,
+                mask=state_mask,
+            )
+
+    else:
+        local = pid - qk_tasks - value_tasks
+        i_hv = local // ngt
+        i_gt = local - i_hv * ngt
+        gate_tokens = i_gt * GATE_T + tl.arange(0, GATE_T)
+        token_mask = gate_tokens < T
+        a_vals = tl.load(
+            a_ptr + gate_tokens * stride_a_tok + i_hv,
+            mask=token_mask,
+            other=0.0,
+        ).to(tl.float32)
+        A_log_val = tl.load(A_log_ptr + i_hv).to(tl.float32)
+        dt_bias_val = tl.load(dt_bias_ptr + i_hv).to(tl.float32)
+        x = a_vals + dt_bias_val
+        softplus = tl.where(
+            x > 0,
+            x + tl.log(1.0 + tl.exp(-x)),
+            tl.log(1.0 + tl.exp(x)),
+        )
+        softplus = tl.where(x <= 20.0, softplus, x)
+        raw_g = -tl.exp(A_log_val) * softplus
+        raw_g = tl.where(token_mask, raw_g, 0.0)
+        tl.store(
+            g_ptr + gate_tokens * HV + i_hv,
+            tl.cumsum(raw_g, axis=0),
+            mask=token_mask,
+        )
+
+
 @triton.jit
 def _qk_norm_4096_inplace_kernel(
     q_ptr,
@@ -337,7 +579,7 @@ def can_use_qwen35_prefill_conv_fusion(
     dt_bias: torch.Tensor,
     activation: str,
 ) -> bool:
-    """Return true only for the measured gfx936 B=1/T=4096 layout."""
+    """Return true for the exact gfx936 single-prefill layout."""
     if not current_platform.is_rocm():
         return False
     from vllm.platforms.rocm import on_gfx936
@@ -356,12 +598,14 @@ def can_use_qwen35_prefill_conv_fusion(
     )
     if not all(isinstance(t, torch.Tensor) for t in tensors):
         return False
+    length = mixed_qkv.shape[0] if mixed_qkv.ndim == 2 else 0
     return (
         on_gfx936()
         and conv_bias is None
         and activation in ("silu", "swish")
         and all(t.is_cuda for t in tensors)
-        and mixed_qkv.shape == (_T, _QKV)
+        and 3 <= length <= _T
+        and mixed_qkv.shape == (length, _QKV)
         and mixed_qkv.dtype == torch.bfloat16
         # Qwen3.5 normally passes the qkv prefix of its packed 16480-wide
         # qkv/z/b/a projection.  The kernel addresses tokens through the
@@ -385,8 +629,8 @@ def can_use_qwen35_prefill_conv_fusion(
         and has_initial_state.is_contiguous()
         and query_start_loc.shape == (2,)
         and query_start_loc.dtype == torch.int32
-        and a.shape == (_T, _HV)
-        and b.shape == (_T, _HV)
+        and a.shape == (length, _HV)
+        and b.shape == (length, _HV)
         and a.dtype == torch.bfloat16
         and b.dtype == torch.bfloat16
         and a.stride(1) == 1
@@ -413,20 +657,74 @@ def fused_qwen35_prefill_conv_prep(
     dt_bias: torch.Tensor,
     fuse_qk_norm: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the already-guarded exact B=1/T=4096 convolution fusion.
+    """Run the guarded exact B=1 convolution fusion.
 
     ``fuse_qk_norm=False`` retains the prior two-launch implementation for
     target-device A/B and bitwise validation.  The production default keeps
     the convolution BF16 rounding boundary inside the same launch, then
     normalizes Q/K without a separate kernel launch.
     """
-    q = torch.empty((_T, _H, _K), device=mixed_qkv.device, dtype=mixed_qkv.dtype)
+    length = mixed_qkv.shape[0]
+    q = torch.empty(
+        (length, _H, _K), device=mixed_qkv.device, dtype=mixed_qkv.dtype
+    )
     k = torch.empty_like(q)
     v = torch.empty(
-        (_T, _HV, _V), device=mixed_qkv.device, dtype=mixed_qkv.dtype
+        (length, _HV, _V), device=mixed_qkv.device, dtype=mixed_qkv.dtype
     )
-    g = torch.empty((_T, _HV), device=mixed_qkv.device, dtype=torch.float32)
+    g = torch.empty((length, _HV), device=mixed_qkv.device, dtype=torch.float32)
     beta = torch.empty_like(g)
+
+    if length != _T:
+        if not fuse_qk_norm:
+            raise ValueError("tail fusion always includes exact Q/K normalization")
+        qk_block_t = 16
+        block_t = 8
+        gate_t = 64
+        qk_nt = triton.cdiv(length, qk_block_t)
+        nt = triton.cdiv(length, block_t)
+        ngt = triton.cdiv(length, gate_t)
+        grid = (_H * qk_nt + _HV * nt + _HV * ngt,)
+        _conv_prep_cumsum_tail_kernel[grid](
+            mixed_qkv,
+            conv_weight,
+            conv_state,
+            state_indices,
+            has_initial_state,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            mixed_qkv.stride(0),
+            conv_weight.stride(0),
+            conv_weight.stride(1),
+            conv_state.stride(0),
+            conv_state.stride(1),
+            conv_state.stride(2),
+            a.stride(0),
+            b.stride(0),
+            q.stride(0),
+            k.stride(0),
+            v.stride(0),
+            T=length,
+            H=_H,
+            HV=_HV,
+            K=_K,
+            V=_V,
+            WIDTH=_WIDTH,
+            QK_BLOCK_T=qk_block_t,
+            BLOCK_T=block_t,
+            GATE_T=gate_t,
+            num_warps=2,
+            num_stages=1,
+            waves_per_eu=1,
+        )
+        return q, k, v, g, beta
 
     # The standalone exact Q/K norm uses 16 tokens per program.  Match that
     # geometry in the fused specialization so Triton's warp reduction order

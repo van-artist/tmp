@@ -1069,10 +1069,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
 
-        # The measured gfx936 throughput path is exactly one 4096-token
-        # prefill.  Fuse its width-4 causal convolution with GDN preparation,
-        # while retaining the mature convolution path for every other shape,
-        # layout, platform, and mixed/speculative batch.
+        # Fuse the gfx936 single-prefill width-4 causal convolution with GDN
+        # preparation.  The 4096-token specialization remains unchanged;
+        # masked tails use one shape-polymorphic launch.  Other layouts and
+        # mixed/speculative batches retain the mature convolution path.
         fused_conv_prefill = (
             attn_metadata.num_prefills == 1
             and attn_metadata.num_decodes == 0
@@ -1096,7 +1096,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         fused_conv_outputs = None
         if fused_conv_prefill:
             logger.info_once(
-                "Using exact gfx936 Qwen3.5 4096-token conv+GDN prep fusion"
+                "Using exact gfx936 Qwen3.5 conv+GDN prep fusion"
             )
             fused_conv_outputs = fused_qwen35_prefill_conv_prep(
                 mixed_qkv=mixed_qkv_non_spec,
