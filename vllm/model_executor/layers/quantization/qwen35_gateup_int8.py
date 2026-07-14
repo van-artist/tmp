@@ -267,6 +267,84 @@ direct_register_custom_op(
 
 
 @triton.jit
+def _dequantize_decode_silu_mul_kernel(
+    accum_ptr,
+    xscale_ptr,
+    wscale_ptr,
+    output_ptr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Fuse the gate/up dequant epilogue with the SwiGLU activation.
+
+    The explicit BF16 casts are semantically important: the old path first
+    stored the two dequantized projections as BF16 and the activation kernel
+    subsequently loaded those rounded values.  Keeping that boundary here
+    avoids silently turning the optimization into a higher-precision model
+    change while still removing the 2*D BF16 temporary and one kernel launch.
+    """
+    cols = tl.program_id(0) * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = cols < D
+    xscale = tl.load(xscale_ptr)
+
+    gate_accum = tl.load(accum_ptr + cols, mask=mask, other=0).to(tl.float32)
+    up_accum = tl.load(accum_ptr + D + cols, mask=mask, other=0).to(tl.float32)
+    gate_scale = xscale * tl.load(
+        wscale_ptr + cols, mask=mask, other=0.0
+    )
+    up_scale = xscale * tl.load(
+        wscale_ptr + D + cols, mask=mask, other=0.0
+    )
+
+    gate = (gate_accum * gate_scale).to(tl.bfloat16).to(tl.float32)
+    up = (up_accum * up_scale).to(tl.bfloat16).to(tl.float32)
+    # The native BF16 activation kernel casts SiLU(gate) back to BF16 before
+    # multiplying it by the BF16 up projection.  Reproduce both roundings.
+    gate_silu = (gate * tl.sigmoid(gate)).to(tl.bfloat16).to(tl.float32)
+    activated = gate_silu * up
+    tl.store(output_ptr + cols, activated, mask=mask)
+
+
+def _qwen35_gateup_dequant_silu_mul(
+    accum: torch.Tensor,
+    xscale: torch.Tensor,
+    wscale: torch.Tensor,
+) -> torch.Tensor:
+    d = wscale.shape[0] // 2
+    output = torch.empty((1, d), device=accum.device, dtype=torch.bfloat16)
+    _dequantize_decode_silu_mul_kernel[(triton.cdiv(d, 2048),)](
+        accum,
+        xscale,
+        wscale,
+        output,
+        D=d,
+        BLOCK_D=2048,
+        num_warps=16,
+    )
+    return output
+
+
+def _qwen35_gateup_dequant_silu_mul_fake(
+    accum: torch.Tensor,
+    xscale: torch.Tensor,
+    wscale: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty(
+        (1, wscale.shape[0] // 2),
+        device=accum.device,
+        dtype=torch.bfloat16,
+    )
+
+
+direct_register_custom_op(
+    op_name="qwen35_gateup_dequant_silu_mul",
+    op_func=_qwen35_gateup_dequant_silu_mul,
+    mutates_args=[],
+    fake_impl=_qwen35_gateup_dequant_silu_mul_fake,
+)
+
+
+@triton.jit
 def _dequantize_weight_kernel(
     qweight_ptr,
     scale_ptr,
@@ -313,6 +391,59 @@ direct_register_custom_op(
     op_func=_qwen35_gateup_dequant_weight,
     mutates_args=["scratch"],
     fake_impl=_qwen35_gateup_dequant_weight_fake,
+)
+
+
+def _qwen35_gateup_int8_silu_apply(
+    x: torch.Tensor,
+    qweight_row: torch.Tensor,
+    qweight_kn: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_pad: torch.Tensor,
+    input_scale: torch.Tensor,
+    scratch: torch.Tensor,
+) -> torch.Tensor:
+    """Run the selected Qwen gate/up projection and return activated values."""
+    x_2d = x.reshape(-1, _QWEN35_GATEUP_K)
+    if x_2d.shape[0] == 1:
+        _qwen35_gateup_quant_input(x_2d, input_pad, input_scale)
+        accum = torch._int_mm(input_pad, qweight_kn)
+        output = _qwen35_gateup_dequant_silu_mul(
+            accum,
+            input_scale,
+            weight_scale,
+        )
+    else:
+        # Prefill keeps the established BF16 weight-dequantization/GEMM and
+        # native activation sequence.  Only its graph boundary changes.
+        _qwen35_gateup_dequant_weight(qweight_row, weight_scale, scratch)
+        gate_up = F.linear(x_2d, scratch)
+        output = torch.empty(
+            (x_2d.shape[0], _QWEN35_GATEUP_N // 2),
+            device=x.device,
+            dtype=x.dtype,
+        )
+        torch.ops._C.silu_and_mul(output, gate_up)
+    return output.reshape(*x.shape[:-1], _QWEN35_GATEUP_N // 2)
+
+
+def _qwen35_gateup_int8_silu_apply_fake(
+    x: torch.Tensor,
+    qweight_row: torch.Tensor,
+    qweight_kn: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_pad: torch.Tensor,
+    input_scale: torch.Tensor,
+    scratch: torch.Tensor,
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], _QWEN35_GATEUP_N // 2))
+
+
+direct_register_custom_op(
+    op_name="qwen35_gateup_int8_silu_apply",
+    op_func=_qwen35_gateup_int8_silu_apply,
+    mutates_args=["input_pad", "input_scale", "scratch"],
+    fake_impl=_qwen35_gateup_int8_silu_apply_fake,
 )
 
 
@@ -464,6 +595,28 @@ def apply_qwen35_gateup_int8(
         )
 
     return torch.ops.vllm.qwen35_gateup_int8_apply(
+        x,
+        layer.qwen35_gateup_qweight_row,
+        layer.qwen35_gateup_qweight_kn,
+        layer.qwen35_gateup_weight_scale,
+        layer.qwen35_gateup_input_pad,
+        layer.qwen35_gateup_input_scale,
+        layer.qwen35_gateup_shared_scratch,
+    )
+
+
+def apply_qwen35_gateup_int8_silu(
+    layer: Any,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the selected Qwen gate/up representation and SwiGLU together."""
+    if x.shape[-1] != _QWEN35_GATEUP_K or x.dtype != torch.bfloat16:
+        raise RuntimeError(
+            "Qwen3.5 gate_up INT8 SwiGLU received an unexpected input "
+            "shape/dtype"
+        )
+
+    return torch.ops.vllm.qwen35_gateup_int8_silu_apply(
         x,
         layer.qwen35_gateup_qweight_row,
         layer.qwen35_gateup_qweight_kn,

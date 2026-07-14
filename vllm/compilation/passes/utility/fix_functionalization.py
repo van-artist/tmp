@@ -138,6 +138,19 @@ class FixFunctionalizationPass(VllmInductorPass):
                 }
                 self.defunctionalize(graph, node, mutated_args)
             elif (
+                hasattr(torch.ops.vllm, "qwen35_gateup_int8_silu_apply")
+                and at_target
+                == torch.ops.vllm.qwen35_gateup_int8_silu_apply.default
+            ):
+                # Same concrete work buffers as qwen35_gateup_int8_apply;
+                # only the decode epilogue and output shape differ.
+                mutated_args = {
+                    1: "input_pad",
+                    2: "input_scale",
+                    3: "scratch",
+                }
+                self.defunctionalize(graph, node, mutated_args)
+            elif (
                 hasattr(torch.ops.vllm, "flashinfer_trtllm_fused_allreduce_norm")
                 and at_target
                 == torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm.default

@@ -50,6 +50,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.qwen35_gateup_int8 import (
+    apply_qwen35_gateup_int8_silu,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -106,8 +109,13 @@ class Qwen2MoeMLP(nn.Module):
         self.expert_gate = expert_gate
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        out = self.act_fn(gate_up)
+        if getattr(self.gate_up_proj, "_qwen35_gateup_int8_enabled", False):
+            # This flag is published only by the exact gfx936/Qwen3.5 post-load
+            # conversion; all ordinary Qwen2/Qwen3 MLPs retain the native path.
+            out = apply_qwen35_gateup_int8_silu(self.gate_up_proj, x)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            out = self.act_fn(gate_up)
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
