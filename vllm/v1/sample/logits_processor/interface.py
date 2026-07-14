@@ -91,6 +91,14 @@ class LogitsProcessor(ABC):
         """
         raise NotImplementedError
 
+    def is_active(self) -> bool:
+        """Whether this processor can currently change any batch logits.
+
+        Custom processors default to active so optimized sampling paths only
+        bypass processors that explicitly report an idle state.
+        """
+        return True
+
     @abstractmethod
     def update_state(
         self,
