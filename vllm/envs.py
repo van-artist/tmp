@@ -113,7 +113,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_GFX936_AITER_GEMV: bool = True
-    VLLM_ROCM_QWEN35_GATEUP_INT8_LAYERS: str = "32"
+    VLLM_ROCM_QWEN35_GATEUP_INT8_LAYERS: str = "48"
     VLLM_ROCM_PREFIX_PREFILL_TILE_M: int = 64
     VLLM_ROCM_PREFIX_PREFILL_TILE_N: int = 32
     VLLM_ROCM_PREFIX_PREFILL_NUM_WARPS: int = 4
@@ -994,7 +994,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # even32, last32, and 64/all.  The conservative branch defaults to the
     # middle 32 layers; set 0 to recover the exact BF16 path without editing.
     "VLLM_ROCM_QWEN35_GATEUP_INT8_LAYERS": lambda: os.getenv(
-        "VLLM_ROCM_QWEN35_GATEUP_INT8_LAYERS", "32"
+        "VLLM_ROCM_QWEN35_GATEUP_INT8_LAYERS", "48"
     ).lower(),
     # Query/key tiles for the dense ROCm prefix-prefill kernel. These do not
     # change the physical or logical KV-cache page size.

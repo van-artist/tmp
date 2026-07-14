@@ -63,13 +63,16 @@ def _selected_layer(layer_idx: int) -> bool:
     # The default 32-layer policy keeps the first and last 16 layers in BF16.
     if mode in ("32", "middle32", "mid32"):
         return 16 <= layer_idx < 48
+    if mode in ("48", "middle48", "mid48"):
+        return 8 <= layer_idx < 56
     if mode in ("even32", "even"):
         return layer_idx % 2 == 0
     if mode in ("last32", "late32"):
         return layer_idx >= 32
     raise ValueError(
         "VLLM_ROCM_QWEN35_GATEUP_INT8_LAYERS must be one of "
-        "0, 32/middle32, even32, last32, or 64/all; got " + repr(mode)
+        "0, 32/middle32, 48/middle48, even32, last32, or 64/all; got "
+        + repr(mode)
     )
 
 
