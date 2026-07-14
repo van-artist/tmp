@@ -19,6 +19,14 @@ from ..solve_tril import FLA_TRIL_PRECISION
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3]
+    ],
+    key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
+)
 @triton.jit(do_not_specialize=["T"])
 def fused_solve_tril_recompute_w_u_kernel(
     A_raw,
@@ -381,4 +389,3 @@ def fused_solve_tril_recompute_w_u(
         DOT_PRECISION=FLA_TRIL_PRECISION,
     )
     return w_out, u_out
-
