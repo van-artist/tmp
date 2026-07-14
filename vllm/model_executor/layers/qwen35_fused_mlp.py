@@ -99,9 +99,12 @@ def _qwen35_swiglu_down_kernel(
             input_precision="ieee",
         )
 
+    # DTK's Triton frontend does not support ``acc[0, :]`` when the leading
+    # index is a constexpr.  Reshape the single-row dot result explicitly.
+    result = tl.reshape(acc, (BLOCK_M,))
     tl.store(
         out_ptr + rows,
-        acc[0, :].to(tl.bfloat16),
+        result.to(tl.bfloat16),
         mask=rows < HIDDEN_SIZE,
     )
 
