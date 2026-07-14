@@ -71,7 +71,7 @@ def _qwen35_swiglu_down_kernel(
 ):
     """Fuse SwiGLU with a tiled Down GEMV without an activation tensor."""
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    acc = tl.zeros((1, BLOCK_M), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
 
     for start in range(0, INTERMEDIATE_SIZE, BLOCK_K):
         cols = start + tl.arange(0, BLOCK_K)
@@ -93,18 +93,14 @@ def _qwen35_swiglu_down_kernel(
             mask=(rows[:, None] < HIDDEN_SIZE) & col_mask[None, :],
             other=0.0,
         )
-        acc += tl.dot(
-            activated[None, :],
-            tl.trans(weights),
-            input_precision="ieee",
+        acc += tl.sum(
+            weights.to(tl.float32) * activated[None, :].to(tl.float32),
+            axis=1,
         )
 
-    # DTK's Triton frontend does not support ``acc[0, :]`` when the leading
-    # index is a constexpr.  Reshape the single-row dot result explicitly.
-    result = tl.reshape(acc, (BLOCK_M,))
     tl.store(
         out_ptr + rows,
-        result.to(tl.bfloat16),
+        acc.to(tl.bfloat16),
         mask=rows < HIDDEN_SIZE,
     )
 
