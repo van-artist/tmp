@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import sys
+from types import ModuleType, SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -36,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
 )
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.worker import gpu_model_runner as gpu_model_runner_module
 from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import select_common_block_size
@@ -124,6 +128,56 @@ def model_runner():
 
 
 model_runner_2 = model_runner
+
+
+def test_qwen35_top1_initializes_with_async_scheduling(monkeypatch):
+    class FakeCausalModel:
+        def __init__(self):
+            self.initialized = False
+
+        def initialize_gfx936_top1(self) -> bool:
+            self.initialized = True
+            return True
+
+    causal_model = FakeCausalModel()
+    runner = object.__new__(GPUModelRunner)
+    runner.parallel_config = SimpleNamespace(
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+    )
+    runner.lora_config = None
+    runner.speculative_config = None
+    runner.use_async_scheduling = True
+    runner.offload_config = SimpleNamespace(
+        uva=SimpleNamespace(cpu_offload_gb=0),
+        prefetch=SimpleNamespace(offload_group_size=0),
+    )
+    runner.model = SimpleNamespace(language_model=causal_model)
+    runner._qwen35_top1_model = None
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "current_platform",
+        SimpleNamespace(is_rocm=lambda: True),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.envs,
+        "VLLM_ROCM_USE_SKINNY_GEMM",
+        True,
+        raising=False,
+    )
+    rocm_module = ModuleType("vllm.platforms.rocm")
+    rocm_module.on_gfx936 = lambda: True
+    monkeypatch.setitem(sys.modules, "vllm.platforms.rocm", rocm_module)
+    monkeypatch.setitem(sys.modules, "vllm._rocm_C", ModuleType("vllm._rocm_C"))
+
+    runner._initialize_qwen35_top1()
+
+    assert causal_model.initialized
+    assert runner._qwen35_top1_model is causal_model
 
 
 def _schedule_new_request(*req_ids: str) -> SchedulerOutput:

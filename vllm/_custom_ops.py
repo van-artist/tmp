@@ -2187,8 +2187,78 @@ def LLMM1(a: torch.Tensor, b: torch.Tensor, rows_per_block: int) -> torch.Tensor
     return torch.ops._rocm_C.LLMM1(a, b, rows_per_block)
 
 
-def qwen35_wave64_gemv(weight: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
-    return torch.ops._rocm_C.qwen35_wave64_gemv(weight, input)
+def LLMM1FP32Top1(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    local_values: torch.Tensor,
+    local_indices: torch.Tensor,
+    result: torch.Tensor,
+    reduction_blocks: int,
+) -> None:
+    torch.ops._rocm_C.LLMM1FP32Top1(
+        a, b, local_values, local_indices, result, reduction_blocks
+    )
+
+
+def LLMM1Top1(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    local_values: torch.Tensor,
+    local_indices: torch.Tensor,
+    result: torch.Tensor,
+    reduction_blocks: int,
+) -> None:
+    torch.ops._rocm_C.LLMM1Top1(
+        a, b, local_values, local_indices, result, reduction_blocks
+    )
+
+
+def LLMM1RMSNormFP32Top1(
+    a: torch.Tensor,
+    hidden: torch.Tensor,
+    norm_weight: torch.Tensor,
+    normalized_hidden: torch.Tensor,
+    local_values: torch.Tensor,
+    local_indices: torch.Tensor,
+    result: torch.Tensor,
+    epsilon: float,
+    reduction_blocks: int,
+) -> None:
+    torch.ops._rocm_C.LLMM1RMSNormFP32Top1(
+        a,
+        hidden,
+        norm_weight,
+        normalized_hidden,
+        local_values,
+        local_indices,
+        result,
+        epsilon,
+        reduction_blocks,
+    )
+
+
+def LLMM1RMSNormTop1(
+    a: torch.Tensor,
+    hidden: torch.Tensor,
+    norm_weight: torch.Tensor,
+    normalized_hidden: torch.Tensor,
+    local_values: torch.Tensor,
+    local_indices: torch.Tensor,
+    result: torch.Tensor,
+    epsilon: float,
+    reduction_blocks: int,
+) -> None:
+    torch.ops._rocm_C.LLMM1RMSNormTop1(
+        a,
+        hidden,
+        norm_weight,
+        normalized_hidden,
+        local_values,
+        local_indices,
+        result,
+        epsilon,
+        reduction_blocks,
+    )
 
 
 def wvSplitK(

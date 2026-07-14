@@ -8,6 +8,7 @@
 
 #include <stdexcept>
 #include <algorithm>
+#include <climits>
 #include <limits>
 
 #include "../cuda_compat.h"
@@ -126,6 +127,13 @@ __device__ __forceinline__ __hip_bfloat162 __float22s2_rn(float2 v) {
   return __float22bfloat162_rn(v);
 }
 
+template <typename scalar2_t>
+__device__ __forceinline__ float dot2_float(scalar2_t a, scalar2_t b) {
+  const float2 af = __s22float2(a);
+  const float2 bf = __s22float2(b);
+  return af.x * bf.x + af.y * bf.y;
+}
+
 template <typename T>
 __device__ __forceinline__ T loadnt(T* addr) {
   return __builtin_nontemporal_load(addr);
@@ -158,47 +166,30 @@ __global__ void LLGemm1_kernel(const scalar_t* in_a, const scalar_t* in_b,
   const int qwarpid = threadid / 16;
   const int qthreadid = threadid % 16;
   float4 rowA_elem4[NUM_A_ROWS_PER_BLOCK];
-  scalar2_t colB_elem4x, colB_elem4y, colB_elem4z, colB_elem4w;
   float acc[NUM_A_ROWS_PER_BLOCK];
-  scalar2_t acch2;
   scalar2_t oval;
-
-  // As we later use warp shuffle operations, we may have more threads in the
-  // block than the actual available data, hence the if guard here.
-  if (threadid * 8 < K) {
-#pragma unroll
-    for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++) {
-      // rowA_elem4[i] holds 8 * half numbers seen as a single float4.
-      rowA_elem4[i] = load_ntmprl(&af4[row_addr + threadid + K / 8 * i]);
-    }
-    colB_elem4x = bf4[threadid * 4 + 0];
-    colB_elem4y = bf4[threadid * 4 + 1];
-    colB_elem4z = bf4[threadid * 4 + 2];
-    colB_elem4w = bf4[threadid * 4 + 3];
-  }
-
-  scalar2_t Af2;
-  float2 S;
-
-  auto Ah2ptr = reinterpret_cast<scalar2_t*>(&rowA_elem4);
-  scalar2_t* ah2lptr;
 
 #pragma unroll
   for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++) {
-    // Multiply-add on 8 scalar_t.
-    ah2lptr = Ah2ptr + i * 4;
-    Af2 = *(ah2lptr);
-    acch2 = __hmul2(Af2, colB_elem4x);
-    Af2 = *(ah2lptr + 1);
-    acch2 = __hfma2(Af2, colB_elem4y, acch2);
-    Af2 = *(ah2lptr + 2);
-    acch2 = __hfma2(Af2, colB_elem4z, acch2);
-    Af2 = *(ah2lptr + 3);
-    acch2 = __hfma2(Af2, colB_elem4w, acch2);
-    S = __s22float2(acch2);
+    acc[i] = 0.f;
+  }
 
-    // See comment above concerning the if guard.
-    acc[i] = (threadid * 8 < K ? S.x + S.y : 0.f);
+  for (int k_chunk = threadid; k_chunk < K / 8; k_chunk += blockDim.x) {
+    const scalar2_t colB_elem4x = bf4[k_chunk * 4 + 0];
+    const scalar2_t colB_elem4y = bf4[k_chunk * 4 + 1];
+    const scalar2_t colB_elem4z = bf4[k_chunk * 4 + 2];
+    const scalar2_t colB_elem4w = bf4[k_chunk * 4 + 3];
+
+#pragma unroll
+    for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++) {
+      // rowA_elem4[i] holds 8 * scalar_t numbers seen as a single float4.
+      rowA_elem4[i] = load_ntmprl(&af4[row_addr + k_chunk + K / 8 * i]);
+      auto ah2lptr = reinterpret_cast<scalar2_t*>(&rowA_elem4[i]);
+      acc[i] += dot2_float(*(ah2lptr), colB_elem4x);
+      acc[i] += dot2_float(*(ah2lptr + 1), colB_elem4y);
+      acc[i] += dot2_float(*(ah2lptr + 2), colB_elem4z);
+      acc[i] += dot2_float(*(ah2lptr + 3), colB_elem4w);
+    }
   }
 
 // all reduce across warp.
@@ -249,11 +240,12 @@ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
 
   // NUM_TREADS need to be a multiple of WARP_SIZE, as we are using warp shuffle
   // operations.
+  const int K_CHUNKS = K / 8;
+  const int K_THREADS = K_CHUNKS % WARP_SIZE == 0
+                            ? K_CHUNKS
+                            : K_CHUNKS + (WARP_SIZE - K_CHUNKS % WARP_SIZE);
   const int NUM_THREADS =
-      max(rows_per_block * 16,
-          K * 2 / 16 % WARP_SIZE == 0
-              ? K * 2 / 16
-              : K * 2 / 16 + (WARP_SIZE - K * 2 / 16 % WARP_SIZE));
+      std::min(1024, std::max(static_cast<int>(rows_per_block * 16), K_THREADS));
 
   int NUM_BLOCKS = M / rows_per_block;
 
@@ -287,114 +279,411 @@ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
   return out_c;
 }
 
-template <typename pair_t>
-__device__ __forceinline__ float qwen35_pair_dot(pair_t lhs, pair_t rhs) {
-  const float2 a = __s22float2(lhs);
-  const float2 b = __s22float2(rhs);
-  return a.x * b.x + a.y * b.y;
+__device__ __forceinline__ bool top1_is_better(float value, int index,
+                                                float best_value,
+                                                int best_index) {
+  return value > best_value ||
+         (value == best_value && index < best_index);
 }
 
-// Each block streams two complete weight rows. Threads own disjoint K/8
-// vectors, accumulate both rows in FP32, reduce within wave64, then let the
-// first wave combine the per-wave partials. The fixed launch width supports
-// large K without exceeding the device thread limit.
+// Normalize only the row selected for sampling. The regular model path
+// normalizes every prefill row before the runner selects the final row.
 template <typename scalar_t>
-__global__ void qwen35_wave64_gemv_kernel(const scalar_t* weight,
-                                           const scalar_t* input,
-                                           scalar_t* output, int K) {
+__global__ void GemmaRMSNormSingleRow_kernel(
+    const scalar_t* hidden, const scalar_t* norm_weight,
+    scalar_t* normalized_hidden, const int K, const float epsilon) {
   using scalar2_t = typename scalar2<scalar_t>::type;
-  using device_scalar_t = typename scalar<scalar_t>::type;
-  const int wave = threadIdx.x / WARP_SIZE;
-  const int lane = threadIdx.x % WARP_SIZE;
-  const int wave_count = blockDim.x / WARP_SIZE;
-  __shared__ float wave_partials[2][16];
+  const auto hidden2 = reinterpret_cast<const scalar2_t*>(hidden);
+  const auto weight2 = reinterpret_cast<const scalar2_t*>(norm_weight);
+  auto output2 = reinterpret_cast<scalar2_t*>(normalized_hidden);
+  __shared__ float rms_smem[WARP_SIZE];
+  __shared__ float inverse_rms;
 
-  const auto* weight4 = reinterpret_cast<const float4*>(weight);
-  const auto* input2 = reinterpret_cast<const scalar2_t*>(input);
-  const int vector_count = K / 8;
-  const int row0_base = blockIdx.x * 2 * vector_count;
-  float row0_sum = 0.0f;
-  float row1_sum = 0.0f;
-  for (int vector = threadIdx.x; vector < vector_count;
-       vector += blockDim.x) {
-    const float4 row0 = load_ntmprl(weight4 + row0_base + vector);
-    const float4 row1 =
-        load_ntmprl(weight4 + row0_base + vector_count + vector);
-    const auto* row0_pairs = reinterpret_cast<const scalar2_t*>(&row0);
-    const auto* row1_pairs = reinterpret_cast<const scalar2_t*>(&row1);
-    const int input_pair = vector * 4;
-#pragma unroll
-    for (int pair = 0; pair < 4; ++pair) {
-      const scalar2_t x = input2[input_pair + pair];
-      row0_sum += qwen35_pair_dot(row0_pairs[pair], x);
-      row1_sum += qwen35_pair_dot(row1_pairs[pair], x);
-    }
+  const int threadid = threadIdx.x;
+  const int warp = threadid / WARP_SIZE;
+  const int lane = threadid % WARP_SIZE;
+  const int num_warps = blockDim.x / WARP_SIZE;
+  float square_sum = 0.0f;
+
+  for (int pair = threadid; pair < K / 2; pair += blockDim.x) {
+    const float2 value = __s22float2(hidden2[pair]);
+    square_sum += value.x * value.x + value.y * value.y;
   }
 
-#pragma unroll
-  for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-    row0_sum += __shfl_down(row0_sum, offset);
-    row1_sum += __shfl_down(row1_sum, offset);
+  for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+    square_sum += __shfl_xor(square_sum, mask);
   }
   if (lane == 0) {
-    wave_partials[0][wave] = row0_sum;
-    wave_partials[1][wave] = row1_sum;
+    rms_smem[warp] = square_sum;
   }
   __syncthreads();
 
-  if (wave == 0) {
-    row0_sum = lane < wave_count ? wave_partials[0][lane] : 0.0f;
-    row1_sum = lane < wave_count ? wave_partials[1][lane] : 0.0f;
-#pragma unroll
-    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-      row0_sum += __shfl_down(row0_sum, offset);
-      row1_sum += __shfl_down(row1_sum, offset);
+  if (warp == 0) {
+    float block_sum = lane < num_warps ? rms_smem[lane] : 0.0f;
+    for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+      block_sum += __shfl_xor(block_sum, mask);
     }
     if (lane == 0) {
-      auto* out = reinterpret_cast<device_scalar_t*>(output);
-      out[blockIdx.x * 2] = __float2s<device_scalar_t>(row0_sum);
-      out[blockIdx.x * 2 + 1] = __float2s<device_scalar_t>(row1_sum);
+      inverse_rms = rsqrtf(block_sum / static_cast<float>(K) + epsilon);
+    }
+  }
+  __syncthreads();
+
+  const float scale = inverse_rms;
+  for (int pair = threadid; pair < K / 2; pair += blockDim.x) {
+    const float2 value = __s22float2(hidden2[pair]);
+    const float2 weight = __s22float2(weight2[pair]);
+    output2[pair] = __float22s2_rn<scalar2_t>(make_float2(
+        value.x * scale * (1.0f + weight.x),
+        value.y * scale * (1.0f + weight.y)));
+  }
+}
+
+// Preserve the high-parallelism two-row LLMM1 launch. The production variant
+// rounds each row exactly where LLMM1 writes its BF16 output before top-1.
+template <typename scalar_t, bool ROUND_TO_OUTPUT>
+__global__ void LLGemm1FP32Top1_candidates_kernel(
+    const scalar_t* in_a, const scalar_t* in_b, float* local_values,
+    int32_t* local_indices, const int K) {
+  using scalar2_t = typename scalar2<scalar_t>::type;
+  auto af4 = reinterpret_cast<const float4*>(in_a);
+  auto bf4 = reinterpret_cast<const scalar2_t*>(in_b);
+  __shared__ float red_smem[2][WARP_SIZE];
+
+  const int threadid = threadIdx.x;
+  const int warp = threadid / WARP_SIZE;
+  const int lane = threadid % WARP_SIZE;
+  const int num_warps = blockDim.x / WARP_SIZE;
+  const int qwarpid = threadid / 16;
+  const int qthreadid = threadid % 16;
+  const int row_addr = blockIdx.x * 2 * K / 8;
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+
+  for (int k_chunk = threadid; k_chunk < K / 8;
+       k_chunk += blockDim.x) {
+    const scalar2_t col_b0 = bf4[k_chunk * 4 + 0];
+    const scalar2_t col_b1 = bf4[k_chunk * 4 + 1];
+    const scalar2_t col_b2 = bf4[k_chunk * 4 + 2];
+    const scalar2_t col_b3 = bf4[k_chunk * 4 + 3];
+    const float4 row0 = load_ntmprl(&af4[row_addr + k_chunk]);
+    const float4 row1 = load_ntmprl(&af4[row_addr + k_chunk + K / 8]);
+    auto row0_ptr = reinterpret_cast<const scalar2_t*>(&row0);
+    auto row1_ptr = reinterpret_cast<const scalar2_t*>(&row1);
+
+    acc0 += dot2_float(row0_ptr[0], col_b0);
+    acc0 += dot2_float(row0_ptr[1], col_b1);
+    acc0 += dot2_float(row0_ptr[2], col_b2);
+    acc0 += dot2_float(row0_ptr[3], col_b3);
+    acc1 += dot2_float(row1_ptr[0], col_b0);
+    acc1 += dot2_float(row1_ptr[1], col_b1);
+    acc1 += dot2_float(row1_ptr[2], col_b2);
+    acc1 += dot2_float(row1_ptr[3], col_b3);
+  }
+
+  for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+    acc0 += __shfl_xor(acc0, mask);
+    acc1 += __shfl_xor(acc1, mask);
+  }
+
+  if (lane < 2) {
+    red_smem[lane][warp] = lane == 0 ? acc0 : acc1;
+  }
+  __syncthreads();
+
+  if (qwarpid < 2) {
+    float row_acc =
+        qthreadid < num_warps ? red_smem[qwarpid][qthreadid] : 0.0f;
+    for (int mask = 16 / 2; mask >= 1; mask /= 2) {
+      row_acc += __shfl_xor(row_acc, mask);
+    }
+    const float paired_acc = __shfl_xor(row_acc, 16);
+
+    if (threadid == 0) {
+      const int row0_index = blockIdx.x * 2;
+      const int row1_index = row0_index + 1;
+      float row0_value = row_acc;
+      float row1_value = paired_acc;
+      if constexpr (ROUND_TO_OUTPUT) {
+        const scalar2_t rounded = __float22s2_rn<scalar2_t>(
+            make_float2(row0_value, row1_value));
+        const float2 rounded_values = __s22float2(rounded);
+        row0_value = rounded_values.x;
+        row1_value = rounded_values.y;
+      }
+      row0_value = row0_value == row0_value
+                       ? row0_value
+                       : -std::numeric_limits<float>::infinity();
+      row1_value = row1_value == row1_value
+                       ? row1_value
+                       : -std::numeric_limits<float>::infinity();
+      const bool choose_row1 =
+          top1_is_better(row1_value, row1_index, row0_value, row0_index);
+      local_values[blockIdx.x] = choose_row1 ? row1_value : row0_value;
+      local_indices[blockIdx.x] =
+          choose_row1 ? row1_index : row0_index;
     }
   }
 }
 
-torch::Tensor qwen35_wave64_gemv(const at::Tensor& weight,
-                                 const at::Tensor& input) {
-  TORCH_CHECK(weight.is_cuda() && input.is_cuda(),
-              "qwen35_wave64_gemv expects device tensors");
-  TORCH_CHECK(weight.is_contiguous() && input.is_contiguous(),
-              "qwen35_wave64_gemv expects contiguous tensors");
-  TORCH_CHECK(weight.dim() == 2 && input.dim() == 2 && input.size(0) == 1,
-              "qwen35_wave64_gemv expects weight[M,K] and input[1,K]");
-  TORCH_CHECK(weight.scalar_type() == input.scalar_type(),
-              "qwen35_wave64_gemv requires matching dtypes");
-  TORCH_CHECK(input.scalar_type() == torch::kBFloat16 ||
-                  input.scalar_type() == torch::kFloat16,
-              "qwen35_wave64_gemv supports BF16 and FP16");
-  const int64_t M64 = weight.size(0);
-  const int64_t K64 = weight.size(1);
-  TORCH_CHECK(input.size(1) == K64 && K64 % 8 == 0 && M64 % 2 == 0,
-              "qwen35_wave64_gemv requires K%8=0 and M%2=0");
-  TORCH_CHECK(M64 <= std::numeric_limits<int>::max() &&
-                  K64 <= std::numeric_limits<int>::max(),
-              "qwen35_wave64_gemv shape exceeds int32 indexing");
+template <int REDUCE_THREADS>
+__device__ __forceinline__ void LLGemm1FP32Top1_block_reduce(
+    float& best_value, int& best_index, float* warp_values,
+    int* warp_indices) {
+  constexpr int NUM_WARPS = REDUCE_THREADS / WARP_SIZE;
+  const int threadid = threadIdx.x;
+  const int lane = threadid % WARP_SIZE;
+  const int warp = threadid / WARP_SIZE;
 
-  auto output = torch::empty({1, M64}, input.options());
-  const int vectors = static_cast<int>(K64 / 8);
-  const int rounded_vectors =
-      ((vectors + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
-  const int threads = std::min(1024, std::max(128, rounded_vectors));
-  const int blocks = static_cast<int>(M64 / 2);
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  for (int offset = WARP_SIZE / 2; offset >= 1; offset /= 2) {
+    const float other_value = __shfl_down(best_value, offset);
+    const int other_index = __shfl_down(best_index, offset);
+    if (top1_is_better(other_value, other_index, best_value, best_index)) {
+      best_value = other_value;
+      best_index = other_index;
+    }
+  }
+
+  if (lane == 0) {
+    warp_values[warp] = best_value;
+    warp_indices[warp] = best_index;
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    best_value = lane < NUM_WARPS
+                     ? warp_values[lane]
+                     : -std::numeric_limits<float>::infinity();
+    best_index = lane < NUM_WARPS ? warp_indices[lane] : INT_MAX;
+    for (int offset = WARP_SIZE / 2; offset >= 1; offset /= 2) {
+      const float other_value = __shfl_down(best_value, offset);
+      const int other_index = __shfl_down(best_index, offset);
+      if (top1_is_better(other_value, other_index, best_value, best_index)) {
+        best_value = other_value;
+        best_index = other_index;
+      }
+    }
+  }
+}
+
+// Reduce disjoint contiguous candidate ranges in place. Each block writes its
+// partial result only after every thread has consumed that block's input range.
+template <int REDUCE_THREADS>
+__global__ void LLGemm1FP32Top1_reduce_stage_kernel(
+    float* local_values, int32_t* local_indices, const int num_candidates) {
+  constexpr int NUM_WARPS = REDUCE_THREADS / WARP_SIZE;
+  __shared__ float warp_values[NUM_WARPS];
+  __shared__ int warp_indices[NUM_WARPS];
+
+  const int begin = static_cast<int>(
+      static_cast<int64_t>(num_candidates) * blockIdx.x / gridDim.x);
+  const int end = static_cast<int>(
+      static_cast<int64_t>(num_candidates) * (blockIdx.x + 1) / gridDim.x);
+  float best_value = -std::numeric_limits<float>::infinity();
+  int best_index = INT_MAX;
+  for (int i = begin + threadIdx.x; i < end; i += REDUCE_THREADS) {
+    const float value = local_values[i];
+    const int index = local_indices[i];
+    if (top1_is_better(value, index, best_value, best_index)) {
+      best_value = value;
+      best_index = index;
+    }
+  }
+
+  LLGemm1FP32Top1_block_reduce<REDUCE_THREADS>(
+      best_value, best_index, warp_values, warp_indices);
+  if (threadIdx.x == 0) {
+    local_values[begin] = best_value;
+    local_indices[begin] = best_index;
+  }
+}
+
+template <int REDUCE_THREADS>
+__global__ void LLGemm1FP32Top1_reduce_final_kernel(
+    const float* local_values, const int32_t* local_indices, int32_t* result,
+    const int num_candidates, const int num_partials) {
+  constexpr int NUM_WARPS = REDUCE_THREADS / WARP_SIZE;
+  __shared__ float warp_values[NUM_WARPS];
+  __shared__ int warp_indices[NUM_WARPS];
+
+  float best_value = -std::numeric_limits<float>::infinity();
+  int best_index = INT_MAX;
+  for (int partial = threadIdx.x; partial < num_partials;
+       partial += REDUCE_THREADS) {
+    const int offset = static_cast<int>(
+        static_cast<int64_t>(num_candidates) * partial / num_partials);
+    const float value = local_values[offset];
+    const int index = local_indices[offset];
+    if (top1_is_better(value, index, best_value, best_index)) {
+      best_value = value;
+      best_index = index;
+    }
+  }
+
+  LLGemm1FP32Top1_block_reduce<REDUCE_THREADS>(
+      best_value, best_index, warp_values, warp_indices);
+  if (threadIdx.x == 0) {
+    result[0] = best_index;
+  }
+}
+
+template <bool ROUND_TO_OUTPUT>
+void LLMM1Top1Impl(const at::Tensor& in_a, const at::Tensor& in_b,
+                   at::Tensor& local_values, at::Tensor& local_indices,
+                   at::Tensor& result, const int64_t reduction_blocks) {
+  TORCH_CHECK(in_a.is_cuda() && in_b.is_cuda(),
+              "LLMM1Top1 inputs must be CUDA tensors.");
+  TORCH_CHECK(in_a.is_contiguous() && in_b.is_contiguous(),
+              "LLMM1Top1 inputs must be contiguous.");
+  TORCH_CHECK(in_a.dim() == 2 && in_b.dim() == 2,
+              "LLMM1Top1 expects 2D tensors.");
+  TORCH_CHECK(in_b.size(0) == 1,
+              "LLMM1Top1 activation tensor must have one row.");
+  TORCH_CHECK(in_a.size(1) == in_b.size(1),
+              "LLMM1Top1 K dimensions must match.");
+  TORCH_CHECK(in_a.scalar_type() == at::kBFloat16 &&
+                  in_b.scalar_type() == at::kBFloat16,
+              "LLMM1Top1 currently supports BF16 only.");
+
+  const int64_t M = in_a.size(0);
+  const int64_t K = in_a.size(1);
+  TORCH_CHECK(M > 0 && M % 2 == 0,
+              "LLMM1Top1 M must be a positive multiple of two.");
+  TORCH_CHECK(K > 0 && K % 8 == 0,
+              "LLMM1Top1 K must be a positive multiple of eight.");
+  const int64_t num_candidates = M / 2;
+  TORCH_CHECK(reduction_blocks > 0 && reduction_blocks <= num_candidates,
+              "LLMM1Top1 reduction_blocks must be in [1, M/2].");
+
+  TORCH_CHECK(local_values.is_cuda() && local_values.is_contiguous() &&
+                  local_values.scalar_type() == at::kFloat &&
+                  local_values.numel() >= num_candidates,
+              "LLMM1Top1 local_values must be contiguous FP32 workspace.");
+  TORCH_CHECK(local_indices.is_cuda() && local_indices.is_contiguous() &&
+                  local_indices.scalar_type() == at::kInt &&
+                  local_indices.numel() >= num_candidates,
+              "LLMM1Top1 local_indices must be contiguous int32 workspace.");
+  TORCH_CHECK(result.is_cuda() && result.is_contiguous() &&
+                  result.scalar_type() == at::kInt && result.numel() >= 1,
+              "LLMM1Top1 result must be a contiguous int32 tensor.");
+  TORCH_CHECK(in_a.get_device() == in_b.get_device() &&
+                  in_a.get_device() == local_values.get_device() &&
+                  in_a.get_device() == local_indices.get_device() &&
+                  in_a.get_device() == result.get_device(),
+              "LLMM1Top1 tensors must be on the same device.");
+
+  const int K_CHUNKS = static_cast<int>(K / 8);
+  const int K_THREADS = K_CHUNKS % WARP_SIZE == 0
+                            ? K_CHUNKS
+                            : K_CHUNKS + (WARP_SIZE - K_CHUNKS % WARP_SIZE);
+  const int NUM_THREADS = std::min(1024, std::max(32, K_THREADS));
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(in_b));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(
-      input.scalar_type(), "qwen35_wave64_gemv", [&] {
-        qwen35_wave64_gemv_kernel<scalar_t>
-            <<<blocks, threads, 0, stream>>>(
-                weight.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
-                output.data_ptr<scalar_t>(), static_cast<int>(K64));
-      });
-  return output;
+
+  LLGemm1FP32Top1_candidates_kernel<c10::BFloat16, ROUND_TO_OUTPUT>
+      <<<num_candidates, NUM_THREADS, 0, stream>>>(
+          in_a.data_ptr<c10::BFloat16>(), in_b.data_ptr<c10::BFloat16>(),
+          local_values.data_ptr<float>(), local_indices.data_ptr<int32_t>(),
+          static_cast<int>(K));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  constexpr int REDUCE_THREADS = 256;
+  LLGemm1FP32Top1_reduce_stage_kernel<REDUCE_THREADS>
+      <<<reduction_blocks, REDUCE_THREADS, 0, stream>>>(
+          local_values.data_ptr<float>(), local_indices.data_ptr<int32_t>(),
+          static_cast<int>(num_candidates));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  LLGemm1FP32Top1_reduce_final_kernel<REDUCE_THREADS>
+      <<<1, REDUCE_THREADS, 0, stream>>>(
+          local_values.data_ptr<float>(), local_indices.data_ptr<int32_t>(),
+          result.data_ptr<int32_t>(), static_cast<int>(num_candidates),
+          static_cast<int>(reduction_blocks));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void LLMM1FP32Top1(const at::Tensor& in_a, const at::Tensor& in_b,
+                   at::Tensor& local_values, at::Tensor& local_indices,
+                   at::Tensor& result, const int64_t reduction_blocks) {
+  LLMM1Top1Impl<false>(in_a, in_b, local_values, local_indices, result,
+                       reduction_blocks);
+}
+
+void LLMM1Top1(const at::Tensor& in_a, const at::Tensor& in_b,
+               at::Tensor& local_values, at::Tensor& local_indices,
+               at::Tensor& result, const int64_t reduction_blocks) {
+  LLMM1Top1Impl<true>(in_a, in_b, local_values, local_indices, result,
+                      reduction_blocks);
+}
+
+template <bool ROUND_TO_OUTPUT>
+void LLMM1RMSNormTop1Impl(
+    const at::Tensor& in_a, const at::Tensor& hidden,
+    const at::Tensor& norm_weight, at::Tensor& normalized_hidden,
+    at::Tensor& local_values, at::Tensor& local_indices, at::Tensor& result,
+    const double epsilon, const int64_t reduction_blocks) {
+  TORCH_CHECK(hidden.is_cuda() && norm_weight.is_cuda() &&
+                  normalized_hidden.is_cuda(),
+              "LLMM1RMSNormTop1 tensors must be CUDA tensors.");
+  TORCH_CHECK(hidden.is_contiguous() && norm_weight.is_contiguous() &&
+                  normalized_hidden.is_contiguous(),
+              "LLMM1RMSNormTop1 tensors must be contiguous.");
+  TORCH_CHECK(hidden.dim() == 2 && hidden.size(0) == 1,
+              "LLMM1RMSNormTop1 hidden tensor must have one row.");
+  TORCH_CHECK(norm_weight.dim() == 1 &&
+                  norm_weight.numel() == hidden.size(1),
+              "LLMM1RMSNormTop1 norm weight shape must match K.");
+  TORCH_CHECK(normalized_hidden.sizes() == hidden.sizes(),
+              "LLMM1RMSNormTop1 normalized workspace shape must match hidden.");
+  TORCH_CHECK(hidden.scalar_type() == at::kBFloat16 &&
+                  norm_weight.scalar_type() == at::kBFloat16 &&
+                  normalized_hidden.scalar_type() == at::kBFloat16,
+              "LLMM1RMSNormTop1 currently supports BF16 only.");
+  TORCH_CHECK(hidden.size(1) > 0 && hidden.size(1) % 8 == 0,
+              "LLMM1RMSNormTop1 K must be a positive multiple of eight.");
+  TORCH_CHECK(epsilon > 0.0,
+              "LLMM1RMSNormTop1 epsilon must be positive.");
+  TORCH_CHECK(hidden.get_device() == norm_weight.get_device() &&
+                  hidden.get_device() == normalized_hidden.get_device(),
+              "LLMM1RMSNormTop1 tensors must be on the same device.");
+
+  const int64_t K = hidden.size(1);
+  const int K_CHUNKS = static_cast<int>(K / 8);
+  const int K_THREADS = K_CHUNKS % WARP_SIZE == 0
+                            ? K_CHUNKS
+                            : K_CHUNKS + (WARP_SIZE - K_CHUNKS % WARP_SIZE);
+  const int NUM_THREADS = std::min(1024, std::max(32, K_THREADS));
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(hidden));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  GemmaRMSNormSingleRow_kernel<c10::BFloat16>
+      <<<1, NUM_THREADS, 0, stream>>>(
+          hidden.data_ptr<c10::BFloat16>(),
+          norm_weight.data_ptr<c10::BFloat16>(),
+          normalized_hidden.data_ptr<c10::BFloat16>(), static_cast<int>(K),
+          static_cast<float>(epsilon));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  LLMM1Top1Impl<ROUND_TO_OUTPUT>(in_a, normalized_hidden, local_values,
+                                 local_indices, result, reduction_blocks);
+}
+
+void LLMM1RMSNormFP32Top1(
+    const at::Tensor& in_a, const at::Tensor& hidden,
+    const at::Tensor& norm_weight, at::Tensor& normalized_hidden,
+    at::Tensor& local_values, at::Tensor& local_indices, at::Tensor& result,
+    const double epsilon, const int64_t reduction_blocks) {
+  LLMM1RMSNormTop1Impl<false>(
+      in_a, hidden, norm_weight, normalized_hidden, local_values,
+      local_indices, result, epsilon, reduction_blocks);
+}
+
+void LLMM1RMSNormTop1(
+    const at::Tensor& in_a, const at::Tensor& hidden,
+    const at::Tensor& norm_weight, at::Tensor& normalized_hidden,
+    at::Tensor& local_values, at::Tensor& local_indices, at::Tensor& result,
+    const double epsilon, const int64_t reduction_blocks) {
+  LLMM1RMSNormTop1Impl<true>(
+      in_a, hidden, norm_weight, normalized_hidden, local_values,
+      local_indices, result, epsilon, reduction_blocks);
 }
 
 #define DOT2C(V0, V2, V3)                                                     \

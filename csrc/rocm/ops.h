@@ -5,8 +5,25 @@
 torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
                     const int64_t rows_per_block);
 
-torch::Tensor qwen35_wave64_gemv(const at::Tensor& weight,
-                                 const at::Tensor& input);
+void LLMM1FP32Top1(const at::Tensor& in_a, const at::Tensor& in_b,
+                   at::Tensor& local_values, at::Tensor& local_indices,
+                   at::Tensor& result, const int64_t reduction_blocks);
+
+void LLMM1Top1(const at::Tensor& in_a, const at::Tensor& in_b,
+               at::Tensor& local_values, at::Tensor& local_indices,
+               at::Tensor& result, const int64_t reduction_blocks);
+
+void LLMM1RMSNormFP32Top1(
+    const at::Tensor& in_a, const at::Tensor& hidden,
+    const at::Tensor& norm_weight, at::Tensor& normalized_hidden,
+    at::Tensor& local_values, at::Tensor& local_indices, at::Tensor& result,
+    const double epsilon, const int64_t reduction_blocks);
+
+void LLMM1RMSNormTop1(
+    const at::Tensor& in_a, const at::Tensor& hidden,
+    const at::Tensor& norm_weight, at::Tensor& normalized_hidden,
+    at::Tensor& local_values, at::Tensor& local_indices, at::Tensor& result,
+    const double epsilon, const int64_t reduction_blocks);
 
 torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
                        const std::optional<at::Tensor>& in_bias,
