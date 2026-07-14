@@ -149,15 +149,19 @@ def _conv_prep_cumsum_4096_kernel(
             stride_state_tok,
             WIDTH,
         )
+        q_offsets = q_ptr + tokens * stride_q_tok + i_h * K + features
         if FUSE_QK_NORM:
-            # _conv_silu_bf16_tile has already reproduced the original
-            # causal-convolution BF16 store/load boundary.  Normalize that
-            # exact BF16 value before its only materialization, avoiding the
-            # later Q read + Q write in the standalone in-place launch.
+            # Force the production BF16 materialization boundary.  A bare
+            # bf16->f32 round trip can be folded by HCU when it remains in
+            # registers; the same-program store/load is exact and still
+            # removes the standalone normalization launch.
+            tl.store(q_offsets, q_f32)
+            tl.debug_barrier()
+            q_f32 = tl.load(q_offsets).to(tl.float32)
             q_f32 *= (
                 1.0 / tl.sqrt(tl.sum(q_f32 * q_f32, axis=1) + 1e-6)
             )[:, None]
-        tl.store(q_ptr + tokens * stride_q_tok + i_h * K + features, q_f32)
+        tl.store(q_offsets, q_f32)
 
         k_channels = H * K + i_h * K + features
         k_f32 = _conv_silu_bf16_tile(
@@ -176,11 +180,15 @@ def _conv_prep_cumsum_4096_kernel(
             stride_state_tok,
             WIDTH,
         )
+        k_offsets = k_ptr + tokens * stride_k_tok + i_h * K + features
         if FUSE_QK_NORM:
+            tl.store(k_offsets, k_f32)
+            tl.debug_barrier()
+            k_f32 = tl.load(k_offsets).to(tl.float32)
             k_f32 *= (
                 1.0 / tl.sqrt(tl.sum(k_f32 * k_f32, axis=1) + 1e-6)
             )[:, None]
-        tl.store(k_ptr + tokens * stride_k_tok + i_h * K + features, k_f32)
+        tl.store(k_offsets, k_f32)
 
         # The first tile has already consumed the old state.  It is the sole
         # writer for both disjoint channel ranges, avoiding inter-program races.
