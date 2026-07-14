@@ -336,7 +336,12 @@ def can_use_qwen35_prefill_conv_fusion(
         and all(t.is_cuda for t in tensors)
         and mixed_qkv.shape == (_T, _QKV)
         and mixed_qkv.dtype == torch.bfloat16
-        and mixed_qkv.is_contiguous()
+        # Qwen3.5 normally passes the qkv prefix of its packed 16480-wide
+        # qkv/z/b/a projection.  The kernel addresses tokens through the
+        # explicit stride, so both that production view and an isolated
+        # contiguous fixture are exact.
+        and mixed_qkv.stride(1) == 1
+        and mixed_qkv.stride(0) in (_QKV, 16480)
         and conv_weight.shape == (_QKV, _WIDTH)
         and conv_weight.dtype == torch.bfloat16
         and conv_weight.is_contiguous()

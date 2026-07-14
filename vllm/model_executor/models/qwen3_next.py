@@ -783,15 +783,35 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # smaller BT value used by chunk_fwd_kernel_o.  This ordering matters
         # for the other kernels whose autotune keys omit T.
         for T in (4096, 16, 32, 64):
-            dummy_mixed_qkv = torch.randn(
-                T,
+            qkv_dim = (
                 2 * num_k_heads * self.head_k_dim
-                + num_v_heads * self.head_v_dim,
-                device=device,
-                dtype=dtype,
+                + num_v_heads * self.head_v_dim
             )
-            dummy_a = torch.randn(T, num_v_heads, device=device, dtype=dtype)
-            dummy_b = torch.randn(T, num_v_heads, device=device, dtype=dtype)
+            if T == 4096:
+                # Reproduce the actual Qwen3.5 packed projection strides so
+                # the first request does not compile a second conv/prep
+                # specialization after KV-cache allocation.
+                packed_dim = (
+                    qkv_dim
+                    + num_v_heads * self.head_v_dim
+                    + 2 * num_v_heads
+                )
+                dummy_packed = torch.randn(
+                    T, packed_dim, device=device, dtype=dtype
+                )
+                dummy_mixed_qkv = dummy_packed[:, :qkv_dim]
+                dummy_b = dummy_packed[:, -2 * num_v_heads : -num_v_heads]
+                dummy_a = dummy_packed[:, -num_v_heads:]
+            else:
+                dummy_mixed_qkv = torch.randn(
+                    T, qkv_dim, device=device, dtype=dtype
+                )
+                dummy_a = torch.randn(
+                    T, num_v_heads, device=device, dtype=dtype
+                )
+                dummy_b = torch.randn(
+                    T, num_v_heads, device=device, dtype=dtype
+                )
             if T == 4096:
                 conv_weights = self.conv1d.weight.view(
                     self.conv1d.weight.size(0), self.conv1d.weight.size(2)
