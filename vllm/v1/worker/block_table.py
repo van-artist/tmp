@@ -69,6 +69,7 @@ class BlockTable:
             self.max_num_reqs, self.max_num_blocks_per_req, dtype=torch.int32
         )
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
+        self._block_table_dirty = True
 
         self.slot_mapping = self._make_buffer(
             self.max_num_batched_tokens, dtype=torch.int64
@@ -105,6 +106,8 @@ class BlockTable:
         if not block_ids:
             return
 
+        self._block_table_dirty = True
+
         if self.use_hybrid_blocks:
             block_ids = self.map_to_kernel_blocks(
                 np.array(block_ids), self.blocks_per_kv_block, self._kernel_block_arange
@@ -116,16 +119,19 @@ class BlockTable:
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
+        self._block_table_dirty = True
         self.num_blocks_per_row[row_idx] = 0
         self.append_row(block_ids, row_idx)
 
     def move_row(self, src: int, tgt: int) -> None:
+        self._block_table_dirty = True
         num_blocks = self.num_blocks_per_row[src]
         block_table_np = self.block_table.np
         block_table_np[tgt, :num_blocks] = block_table_np[src, :num_blocks]
         self.num_blocks_per_row[tgt] = num_blocks
 
     def swap_row(self, src: int, tgt: int) -> None:
+        self._block_table_dirty = True
         src_tgt, tgt_src = [src, tgt], [tgt, src]
         self.num_blocks_per_row[src_tgt] = self.num_blocks_per_row[tgt_src]
         self.block_table.np[src_tgt] = self.block_table.np[tgt_src]
@@ -191,7 +197,10 @@ class BlockTable:
             )
 
     def commit_block_table(self, num_reqs: int) -> None:
+        if not self._block_table_dirty:
+            return
         self.block_table.copy_to_gpu(num_reqs)
+        self._block_table_dirty = False
 
     def commit_slot_mapping(self, num_tokens: int) -> None:
         self.slot_mapping.copy_to_gpu(num_tokens)
@@ -199,6 +208,7 @@ class BlockTable:
     def clear(self) -> None:
         self.block_table.gpu.fill_(0)
         self.block_table.cpu.fill_(0)
+        self._block_table_dirty = False
 
     @staticmethod
     def map_to_kernel_blocks(
