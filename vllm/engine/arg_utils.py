@@ -2146,11 +2146,42 @@ class EngineArgs:
         orig_max_num_batched_tokens = self.max_num_batched_tokens
         orig_max_num_seqs = self.max_num_seqs
 
+        # The contest's Qwen3.5-27B path has measured, numerically guarded GDN
+        # and GEMM specializations for one 4096-token prefill step.  The generic
+        # OpenAI-server default is 2048 on this device class, which otherwise
+        # splits every prompt into 2048-token steps and bypasses those kernels.
+        # Keep this override exact to the target model/platform and never reduce
+        # an explicitly larger user budget.
+        force_qwen35_gfx936_prefill_4096 = (
+            current_platform.is_rocm()
+            and model_config.architecture == "Qwen3_5ForConditionalGeneration"
+            and model_config.dtype == torch.bfloat16
+            and self.tensor_parallel_size == 1
+            and self.pipeline_parallel_size == 1
+            and model_config.hf_text_config.hidden_size == 5120
+            and model_config.hf_text_config.num_hidden_layers == 64
+        )
+        if force_qwen35_gfx936_prefill_4096:
+            from vllm.platforms.rocm import on_gfx936
+
+            force_qwen35_gfx936_prefill_4096 = on_gfx936()
+
         if self.max_num_batched_tokens is None:
             self.max_num_batched_tokens = default_max_num_batched_tokens.get(
                 usage_context,
                 SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS,
             )
+
+        if (
+            force_qwen35_gfx936_prefill_4096
+            and self.max_num_batched_tokens < 4096
+        ):
+            logger.info(
+                "Raising max_num_batched_tokens from %d to 4096 for the exact "
+                "gfx936 Qwen3.5-27B prefill path.",
+                self.max_num_batched_tokens,
+            )
+            self.max_num_batched_tokens = 4096
 
         if self.max_num_seqs is None:
             self.max_num_seqs = default_max_num_seqs.get(
