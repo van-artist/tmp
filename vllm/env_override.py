@@ -5,6 +5,21 @@ import importlib.util
 import os
 
 
+def _activate_bundled_dcu_gemm_table() -> None:
+    """Point rocBLAS at the contest-device shape table before torch import."""
+    key = "ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH"
+    if os.environ.get(key) or not os.path.exists("/opt/dtk"):
+        return
+    table = os.path.join(
+        os.path.dirname(__file__),
+        "assets",
+        "rocblas",
+        "qwen35_gfx936_4096.csv",
+    )
+    if os.path.isfile(table):
+        os.environ[key] = os.path.abspath(table)
+
+
 def _get_torch_cuda_version():
     """Peripheral function to _maybe_set_cuda_compatibility_path().
     PyTorch version must not be determined by importing directly
@@ -82,6 +97,7 @@ def _maybe_set_cuda_compatibility_path():
     os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(new_paths)
 
 
+_activate_bundled_dcu_gemm_table()
 _maybe_set_cuda_compatibility_path()
 
 import torch
