@@ -10,7 +10,6 @@ from vllm import _custom_ops as ops
 from vllm import envs
 from vllm._aiter_ops import IS_AITER_FOUND, rocm_aiter_ops
 from vllm.logger import init_logger
-from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -191,35 +190,7 @@ def rocm_unquantized_gemm_impl(
     # SplitK heuristics, and send every other shape straight to the unchanged
     # PyTorch fallback.
     if on_gfx936():
-        # On the contest's exact 4096-token Qwen3.5 gate/up projection,
-        # hipBLASLt is measurably faster than hipBLAS while producing bitwise
-        # identical BF16 output.  Other large projections regress under Lt,
-        # so keep the choice local to this one call and immediately restore
-        # the default backend.  The official workload has a single model-
-        # execution thread and concurrency one.
-        use_gateup_prefill_hipblaslt = (
-            n == 4096
-            and m == 34816
-            and k == 5120
-            and bias is None
-            and x.is_cuda
-            and x.dtype == torch.bfloat16
-            and weight.dtype == x.dtype
-            and weight.device == x.device
-            and weight.ndim == 2
-            and x.is_contiguous()
-            and weight.is_contiguous()
-            and not vllm_is_batch_invariant()
-        )
-        if use_gateup_prefill_hipblaslt:
-            previous_blas = torch.backends.cuda.preferred_blas_library()
-            torch.backends.cuda.preferred_blas_library("cublaslt")
-            try:
-                return torch.nn.functional.linear(x, weight)
-            finally:
-                torch.backends.cuda.preferred_blas_library(previous_blas)
-
-        if not (
+        use_aiter = (
             use_aiter_triton_gemm(n, m, k, x.dtype)
             and bias is None
             and x.is_cuda
@@ -228,24 +199,51 @@ def rocm_unquantized_gemm_impl(
             and weight.ndim == 2
             and x.is_contiguous()
             and weight.is_contiguous()
-        ):
-            return torch.nn.functional.linear(x, weight, bias)
-
-        try:
-            from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
-        except (AttributeError, ImportError, OSError):
-            return torch.nn.functional.linear(x, weight, bias)
-
-        x_2d = x.reshape(n, k)
-        out_2d = x.new_empty((n, m))
-        out_2d = gemm_a16w16(
-            x_2d,
-            weight,
-            dtype=x.dtype,
-            y=out_2d,
-            config=_GFX936_QWEN35_AITER_GEMM_CONFIGS[(n, m, k)],
         )
-        return out_2d.reshape(*x.shape[:-1], m)
+
+        if use_aiter:
+            try:
+                from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+            except (AttributeError, ImportError, OSError):
+                use_aiter = False
+
+        if use_aiter:
+            x_2d = x.reshape(n, k)
+            out_2d = x.new_empty((n, m))
+            out_2d = gemm_a16w16(
+                x_2d,
+                weight,
+                dtype=x.dtype,
+                y=out_2d,
+                config=_GFX936_QWEN35_AITER_GEMM_CONFIGS[(n, m, k)],
+            )
+            return out_2d.reshape(*x.shape[:-1], m)
+
+        # The upstream LLMM1 kernel used one thread per K/8 chunk and was
+        # therefore limited to K <= 8192. The gfx936 variant streams multiple
+        # chunks per thread with FP32 accumulation, so it can cover the exact
+        # Qwen3.5 M=1 projections up to the 17408-wide MLP down input. Keep the
+        # already measured AITER shapes above at higher priority.
+        use_llmm1 = (
+            envs.VLLM_ROCM_USE_SKINNY_GEMM
+            and n == 1
+            and m % 4 == 0
+            and k % 8 == 0
+            and k <= 32768
+            and bias is None
+            and x.is_cuda
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and weight.dtype == x.dtype
+            and weight.device == x.device
+            and x.is_contiguous()
+            and weight.is_contiguous()
+        )
+        if use_llmm1:
+            x_2d = x.reshape(1, k)
+            out = ops.LLMM1(weight, x_2d, 2)
+            return out.reshape(*x.shape[:-1], m)
+
+        return torch.nn.functional.linear(x, weight, bias)
 
     cu_count = num_compute_units()
 

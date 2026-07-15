@@ -24,6 +24,9 @@ NKM_FACTORS_LLMM1 = [
     # Edge cases with specific K sizes
     (1, 6144, 1024),
     (1, 8192, 2048),
+    # Qwen3.5-27B decode projection shapes covered by the gfx936 large-K path.
+    (1, 6144, 5120),
+    (1, 17408, 5120),
     # Very large case
     (1, 4096, 8192),
 ]

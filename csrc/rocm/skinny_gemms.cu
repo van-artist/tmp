@@ -125,6 +125,13 @@ __device__ __forceinline__ __hip_bfloat162 __float22s2_rn(float2 v) {
   return __float22bfloat162_rn(v);
 }
 
+template <typename scalar2_t>
+__device__ __forceinline__ float dot2_float(scalar2_t a, scalar2_t b) {
+  const float2 af = __s22float2(a);
+  const float2 bf = __s22float2(b);
+  return af.x * bf.x + af.y * bf.y;
+}
+
 template <typename T>
 __device__ __forceinline__ T loadnt(T* addr) {
   return __builtin_nontemporal_load(addr);
@@ -157,47 +164,32 @@ __global__ void LLGemm1_kernel(const scalar_t* in_a, const scalar_t* in_b,
   const int qwarpid = threadid / 16;
   const int qthreadid = threadid % 16;
   float4 rowA_elem4[NUM_A_ROWS_PER_BLOCK];
-  scalar2_t colB_elem4x, colB_elem4y, colB_elem4z, colB_elem4w;
   float acc[NUM_A_ROWS_PER_BLOCK];
-  scalar2_t acch2;
   scalar2_t oval;
-
-  // As we later use warp shuffle operations, we may have more threads in the
-  // block than the actual available data, hence the if guard here.
-  if (threadid * 8 < K) {
-#pragma unroll
-    for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++) {
-      // rowA_elem4[i] holds 8 * half numbers seen as a single float4.
-      rowA_elem4[i] = load_ntmprl(&af4[row_addr + threadid + K / 8 * i]);
-    }
-    colB_elem4x = bf4[threadid * 4 + 0];
-    colB_elem4y = bf4[threadid * 4 + 1];
-    colB_elem4z = bf4[threadid * 4 + 2];
-    colB_elem4w = bf4[threadid * 4 + 3];
-  }
-
-  scalar2_t Af2;
-  float2 S;
-
-  auto Ah2ptr = reinterpret_cast<scalar2_t*>(&rowA_elem4);
-  scalar2_t* ah2lptr;
 
 #pragma unroll
   for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++) {
-    // Multiply-add on 8 scalar_t.
-    ah2lptr = Ah2ptr + i * 4;
-    Af2 = *(ah2lptr);
-    acch2 = __hmul2(Af2, colB_elem4x);
-    Af2 = *(ah2lptr + 1);
-    acch2 = __hfma2(Af2, colB_elem4y, acch2);
-    Af2 = *(ah2lptr + 2);
-    acch2 = __hfma2(Af2, colB_elem4z, acch2);
-    Af2 = *(ah2lptr + 3);
-    acch2 = __hfma2(Af2, colB_elem4w, acch2);
-    S = __s22float2(acch2);
+    acc[i] = 0.f;
+  }
 
-    // See comment above concerning the if guard.
-    acc[i] = (threadid * 8 < K ? S.x + S.y : 0.f);
+  // Cap the launch at 1024 threads and let each thread stream multiple K/8
+  // chunks. This preserves FP32 accumulation while supporting Qwen3.5's
+  // large-K decode projections (notably the 17408-wide MLP down input).
+  for (int k_chunk = threadid; k_chunk < K / 8; k_chunk += blockDim.x) {
+    const scalar2_t colB_elem4x = bf4[k_chunk * 4 + 0];
+    const scalar2_t colB_elem4y = bf4[k_chunk * 4 + 1];
+    const scalar2_t colB_elem4z = bf4[k_chunk * 4 + 2];
+    const scalar2_t colB_elem4w = bf4[k_chunk * 4 + 3];
+
+#pragma unroll
+    for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++) {
+      rowA_elem4[i] = load_ntmprl(&af4[row_addr + k_chunk + K / 8 * i]);
+      auto ah2lptr = reinterpret_cast<scalar2_t*>(&rowA_elem4[i]);
+      acc[i] += dot2_float(ah2lptr[0], colB_elem4x);
+      acc[i] += dot2_float(ah2lptr[1], colB_elem4y);
+      acc[i] += dot2_float(ah2lptr[2], colB_elem4z);
+      acc[i] += dot2_float(ah2lptr[3], colB_elem4w);
+    }
   }
 
 // all reduce across warp.
@@ -248,11 +240,12 @@ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
 
   // NUM_TREADS need to be a multiple of WARP_SIZE, as we are using warp shuffle
   // operations.
+  const int K_CHUNKS = K / 8;
+  const int K_THREADS = K_CHUNKS % WARP_SIZE == 0
+                            ? K_CHUNKS
+                            : K_CHUNKS + (WARP_SIZE - K_CHUNKS % WARP_SIZE);
   const int NUM_THREADS =
-      max(rows_per_block * 16,
-          K * 2 / 16 % WARP_SIZE == 0
-              ? K * 2 / 16
-              : K * 2 / 16 + (WARP_SIZE - K * 2 / 16 % WARP_SIZE));
+      std::min(1024, std::max(static_cast<int>(rows_per_block * 16), K_THREADS));
 
   int NUM_BLOCKS = M / rows_per_block;
 

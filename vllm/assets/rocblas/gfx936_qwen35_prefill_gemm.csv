@@ -1,0 +1,5 @@
+transA,transB,M,N,batch_count,K,alpha,beta,lda,ldb,ldc,input_type,output_type,compute_type,solution_index
+T,N,34816,4096,1,5120,1,0,5120,5120,34816,bf16_r,bf16_r,f32_r,20981
+T,N,5120,4096,1,17408,1,0,17408,17408,5120,bf16_r,bf16_r,f32_r,20845
+T,N,14336,4096,1,5120,1,0,5120,5120,14336,bf16_r,bf16_r,f32_r,20981
+T,N,5120,4096,1,6144,1,0,6144,6144,5120,bf16_r,bf16_r,f32_r,20981
