@@ -119,6 +119,7 @@ def kernel_unified_attention_2d(
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
+    PACK_Q_HEAD_ROWS: tl.constexpr,
     USE_FP8: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
@@ -126,29 +127,36 @@ def kernel_unified_attention_2d(
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
 
-    seq_idx = find_seq_idx(
-        query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
-    )
-
-    q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
-
-    q_block_local_idx = q_block_global_idx - q_block_start_idx
+    if PACK_Q_HEAD_ROWS:
+        seq_idx = 0
+        first_qh_row = q_block_global_idx * BLOCK_M
+        q_block_local_idx = 0
+    else:
+        seq_idx = find_seq_idx(
+            query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
+        )
+        q_block_start_idx = (
+            tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
+        )
+        q_block_local_idx = q_block_global_idx - q_block_start_idx
+        first_qh_row = q_block_local_idx * BLOCK_Q * num_queries_per_kv
 
     cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
     cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
 
     cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
 
-    if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
+    if first_qh_row >= cur_batch_query_len * num_queries_per_kv:
         return
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     offs_t = tl.arange(0, TILE_SIZE)
-    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+    qh_row = first_qh_row + offs_m
+    query_pos = qh_row // num_queries_per_kv
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
-    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+    query_offset_1 = kv_head_idx * num_queries_per_kv + qh_row % num_queries_per_kv
     query_offset = (
         query_offset_0[:, None] * query_stride_0
         + query_offset_1[:, None] * query_stride_1
@@ -159,7 +167,10 @@ def kernel_unified_attention_2d(
     # BLOCK_M is flattened over query-token/GQA-head rows. For non-power-of-two
     # GQA ratios (Qwen3.5 uses 6), a power-of-two BLOCK_M otherwise spills into
     # the next query token and races the following program. Mask those tail rows.
-    valid_m = offs_m < BLOCK_Q * num_queries_per_kv
+    if PACK_Q_HEAD_ROWS:
+        valid_m = offs_m < BLOCK_M
+    else:
+        valid_m = offs_m < BLOCK_Q * num_queries_per_kv
     query_mask_0 = ((query_pos < cur_batch_query_len) & valid_m).to(tl.int1)
     query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
 
@@ -204,7 +215,8 @@ def kernel_unified_attention_2d(
 
     # compute the length of the longest sequence prefix spanned by any
     # query token in the current q_block (q_block_local_idx)
-    max_seq_prefix_len = context_len + (q_block_local_idx + 1) * BLOCK_Q
+    last_query_pos = (first_qh_row + BLOCK_M - 1) // num_queries_per_kv
+    max_seq_prefix_len = context_len + last_query_pos + 1
 
     if USE_MM_PREFIX:
         # image bidirectional attention ranges require a full range
@@ -227,8 +239,8 @@ def kernel_unified_attention_2d(
     # TODO(Isotr0py): sliding window pruning with image bidirectional mask
     if SLIDING_WINDOW > 0 and not USE_MM_PREFIX:
         # Query rows covered by this Q-block
-        qpos_lo = q_block_local_idx * BLOCK_Q
-        qpos_hi = tl.minimum(qpos_lo + BLOCK_Q - 1, cur_batch_query_len - 1)
+        qpos_lo = first_qh_row // num_queries_per_kv
+        qpos_hi = tl.minimum(last_query_pos, cur_batch_query_len - 1)
         # For sliding window, each query position q can only attend to
         # keys in the range [q_abs - SLIDING_WINDOW + 1, q_abs]
         # where q_abs = context_len + q
@@ -417,7 +429,7 @@ def kernel_unified_attention_2d(
         M = m_j
 
         if SLIDING_WINDOW:
-            qpos_lo = q_block_local_idx * BLOCK_Q
+            qpos_lo = first_qh_row // num_queries_per_kv
             V = tl.where(
                 (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW, V, 0.0
             )
@@ -1061,7 +1073,19 @@ def unified_attention(
     #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
-    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+    pack_q_head_rows = (
+        gfx936_qwen35_prefill
+        and num_seqs == 1
+        and num_query_heads == 24
+        and num_kv_heads == 4
+        and num_queries_per_kv == 6
+    )
+    if pack_q_head_rows:
+        total_num_q_blocks = triton.cdiv(
+            q.shape[0] * num_queries_per_kv, BLOCK_M
+        )
+    else:
+        total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
 
     # Tile sizes for prefill and decode. Gemma3 models use optimized values.
     # Note: tile size must be at least 32 for fp8 (element_size == 1).
@@ -1186,6 +1210,7 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
+            PACK_Q_HEAD_ROWS=pack_q_head_rows,
             USE_FP8=output_scale is not None,
             **qwen35_launch_config,
         )
