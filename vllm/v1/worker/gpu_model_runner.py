@@ -182,6 +182,7 @@ from vllm.v1.worker.cp_utils import (
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
+from vllm.v1.worker.gpu_decode_input_prep import V1SingleTokenDecodeInputPreparer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -470,6 +471,29 @@ class GPUModelRunner(
 
         # Async scheduling
         self.use_async_scheduling = self.scheduler_config.async_scheduling
+
+        self._qwen35_v1_input_gpu_capable = False
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx936
+
+            self._qwen35_v1_input_gpu_capable = (
+                on_gfx936()
+                and (
+                    "Qwen3_5ForConditionalGeneration"
+                    in self.model_config.architectures
+                )
+                and self.speculative_config is None
+                and self.lora_config is None
+                and self.use_async_scheduling
+                and self.parallel_config.tensor_parallel_size == 1
+                and self.parallel_config.pipeline_parallel_size == 1
+                and self.dcp_world_size == 1
+                and self.uses_xdrope_dim == 0
+            )
+        self._qwen35_decode_input_preparer: (
+            V1SingleTokenDecodeInputPreparer | None
+        ) = None
+        self._qwen35_gpu_decode_logged = False
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
@@ -1686,6 +1710,11 @@ class GPUModelRunner(
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
 
+        if self._can_use_qwen35_gpu_decode_input_prep(
+            scheduler_output, num_scheduled_tokens
+        ):
+            return self._prepare_qwen35_gpu_decode_inputs()
+
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
@@ -1882,6 +1911,96 @@ class GPUModelRunner(
             logits_indices,
             spec_decode_metadata,
         )
+
+    def _can_use_qwen35_gpu_decode_input_prep(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens: np.ndarray,
+    ) -> bool:
+        preparer = self._qwen35_decode_input_preparer
+        sampled_token_ids = self.input_batch.prev_sampled_token_ids
+        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+        if (
+            preparer is None
+            or self.input_batch.num_reqs != 1
+            or num_scheduled_tokens.shape != (1,)
+            or int(num_scheduled_tokens[0]) != 1
+            or scheduler_output.total_num_scheduled_tokens != 1
+            or scheduler_output.scheduled_spec_decode_tokens
+            or scheduler_output.scheduled_encoder_inputs
+            or sampled_token_ids is None
+            or prev_req_id_to_index is None
+            or sampled_token_ids.ndim != 2
+            or sampled_token_ids.shape != (1, 1)
+            or sampled_token_ids.dtype != self.input_ids.gpu.dtype
+            or sampled_token_ids.device != self.input_ids.gpu.device
+        ):
+            return False
+
+        req_id = self.input_batch.req_ids[0]
+        if prev_req_id_to_index.get(req_id) != 0:
+            return False
+
+        position = int(self.input_batch.num_computed_tokens_cpu[0])
+        if position < int(self.input_batch.num_prompt_tokens[0]):
+            return False
+        if position + 1 != self.requests[req_id].num_tokens:
+            return False
+
+        # The GPU seq_len from the preceding step is the current decode
+        # position. This host-side check prevents stale GPU state after a
+        # preemption, request replacement, or non-unit scheduler advance.
+        return int(self.seq_lens.np[0]) == position
+
+    def _prepare_qwen35_gpu_decode_inputs(
+        self,
+    ) -> tuple[torch.Tensor, SpecDecodeMetadata | None]:
+        preparer = self._qwen35_decode_input_preparer
+        sampled_token_ids = self.input_batch.prev_sampled_token_ids
+        assert preparer is not None and sampled_token_ids is not None
+
+        req_id = self.input_batch.req_ids[0]
+        position = int(self.input_batch.num_computed_tokens_cpu[0])
+        mrope_delta = 0
+        mrope_positions = None
+        if self.uses_mrope:
+            req_state = self.requests[req_id]
+            assert req_state.mrope_position_delta is not None
+            mrope_delta = int(req_state.mrope_position_delta)
+            mrope_positions = self.mrope_positions.gpu
+            self.mrope_positions.np[:, 0] = position + mrope_delta
+        else:
+            self.positions.np[0] = position
+
+        # Keep CPU mirrors valid for attention metadata builders. The GPU
+        # tensors themselves are written by one fused Triton launch below.
+        self.query_start_loc.np[0] = 0
+        self.query_start_loc.np[1:].fill(1)
+        self.seq_lens.np[0] = position + 1
+        self.seq_lens.np[1:].fill(0)
+        self.discard_request_mask.np.fill(False)
+        if self.enable_prompt_embeds:
+            self.is_token_ids.np[0] = True
+
+        logits_indices = preparer.prepare(
+            sampled_token_ids=sampled_token_ids,
+            input_ids=self.input_ids.gpu,
+            positions=self.positions.gpu,
+            mrope_positions=mrope_positions,
+            query_start_loc=self.query_start_loc.gpu,
+            seq_lens=self.seq_lens.gpu,
+            discard_request_mask=self.discard_request_mask.gpu,
+            is_token_ids=self.is_token_ids.gpu,
+            position=position,
+            mrope_delta=mrope_delta,
+            write_is_token_ids=self.enable_prompt_embeds,
+        )
+        if not self._qwen35_gpu_decode_logged:
+            logger.info(
+                "[dcu-v1-input-gpu] dispatched Qwen3.5 single-token decode input"
+            )
+            self._qwen35_gpu_decode_logged = True
+        return logits_indices, None
 
     def _build_attention_metadata(
         self,
@@ -6211,6 +6330,16 @@ class GPUModelRunner(
             f"InputBatch kernel_block_sizes {self._init_kernel_block_sizes} "
             f"!= kv_cache kernel_block_sizes {kernel_block_sizes}"
         )
+
+        if self._qwen35_v1_input_gpu_capable:
+            self._qwen35_decode_input_preparer = V1SingleTokenDecodeInputPreparer(
+                block_tables=self.input_batch.block_table.block_tables,
+                max_num_reqs=self.max_num_reqs,
+                device=self.device,
+            )
+            logger.info(
+                "[dcu-v1-input-gpu] reserved gfx936 Qwen3.5 decode input state"
+            )
 
     def _allocate_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig
