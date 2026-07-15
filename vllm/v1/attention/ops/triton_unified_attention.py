@@ -331,6 +331,14 @@ def kernel_unified_attention_2d(
             if CAUSAL_FULL_TILE_FAST
             else False
         )
+        # ``fully_visible`` depends on runtime sequence metadata.  Triton still
+        # requires values referenced after this conditional to be defined on
+        # every control-flow edge, even though ``seq_mask`` is consumed only by
+        # the non-full branch below.  Start with the identity mask and replace
+        # it for diagonal/tail tiles.
+        seq_mask = tl.full(
+            (BLOCK_M, TILE_SIZE), True, dtype=tl.int1
+        )
         if not fully_visible:
             # Compute attention mask only for diagonal/tail tiles. The exact
             # Qwen long-prefill path has hundreds of fully visible history
