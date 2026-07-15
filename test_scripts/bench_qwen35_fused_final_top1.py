@@ -141,7 +141,9 @@ def main() -> None:
     probe_weight[1].fill_(1)
     probe_weight[1, 0] = 2
     probe_normalized = compiled_norm(probe_hidden, probe_norm_weight)
-    bf16_probe_token = token_id(ops.LLMM1(probe_weight, probe_normalized, 2).argmax())
+    bf16_probe_token = token_id(
+        torch.nn.functional.linear(probe_normalized, probe_weight).argmax()
+    )
     fused_probe_token = token_id(probe_candidate())
     fp32_probe_token = token_id(
         torch.mv(probe_weight.float(), probe_normalized[0].float()).argmax()
@@ -153,16 +155,16 @@ def main() -> None:
     probe_weight.zero_()
     probe_hidden.zero_()
     zero_baseline_token = token_id(
-        ops.LLMM1(
-            probe_weight, compiled_norm(probe_hidden, probe_norm_weight), 2
+        torch.nn.functional.linear(
+            compiled_norm(probe_hidden, probe_norm_weight), probe_weight
         ).argmax()
     )
     zero_candidate_token = token_id(probe_candidate())
     zero_tie_pass = zero_baseline_token == zero_candidate_token == 0
     probe_hidden.fill_(float("nan"))
     nan_baseline_token = token_id(
-        ops.LLMM1(
-            probe_weight, compiled_norm(probe_hidden, probe_norm_weight), 2
+        torch.nn.functional.linear(
+            compiled_norm(probe_hidden, probe_norm_weight), probe_weight
         ).argmax()
     )
     nan_candidate_token = token_id(probe_candidate())
@@ -177,7 +179,9 @@ def main() -> None:
         probe_hidden.normal_()
         expected_normalized = compiled_norm(probe_hidden, probe_norm_weight)
         expected_token = token_id(
-            ops.LLMM1(probe_weight, expected_normalized, 2).argmax()
+            torch.nn.functional.linear(
+                expected_normalized, probe_weight
+            ).argmax()
         )
         actual_token = token_id(probe_candidate())
         actual_normalized = probe_workspace[0]
@@ -208,7 +212,9 @@ def main() -> None:
 
     def standard_tail() -> torch.Tensor:
         normalized_hidden = compiled_norm(hidden, norm_weight)
-        return ops.LLMM1(weight, normalized_hidden, 2).float().argmax()
+        return torch.nn.functional.linear(
+            normalized_hidden, weight
+        ).float().argmax()
 
     def top1_tail() -> torch.Tensor:
         normalized_hidden = compiled_norm(hidden, norm_weight)
@@ -234,7 +240,9 @@ def main() -> None:
             EPSILON,
             args.reduction_blocks,
         )
-        return result
+        # Production returns a step-owned token tensor so async D2H cannot
+        # race reuse of the persistent result workspace.
+        return result.clone()
 
     top1_baseline_mismatches = 0
     fused_baseline_mismatches = 0
@@ -281,7 +289,7 @@ def main() -> None:
             EPSILON,
             args.reduction_blocks,
         )
-        return result
+        return result.clone()
 
     full_prefill_token = token_id(full_prefill_tail())
     deferred_prefill_token = token_id(deferred_prefill_tail())

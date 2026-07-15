@@ -755,7 +755,11 @@ class Qwen3_5ForCausalLMBase(
             self.model.norm.variance_epsilon,
             80,
         )
-        return result.view(1, 1)
+        # Async scheduling copies sampled ids to the host on a separate stream.
+        # Return an allocation owned by this step so the persistent kernel
+        # workspace can be overwritten by the next decode without racing that
+        # non-blocking D2H copy.
+        return result.view(1, 1).clone()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
