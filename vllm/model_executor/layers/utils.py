@@ -18,6 +18,27 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
+_ROCM_LLMM1_AVAILABLE: bool | None = None
+
+
+def rocm_llmm1_available() -> bool:
+    global _ROCM_LLMM1_AVAILABLE
+    if _ROCM_LLMM1_AVAILABLE is None:
+        try:
+            import vllm._rocm_C  # noqa: F401
+        except ImportError:
+            _ROCM_LLMM1_AVAILABLE = False
+        else:
+            _ROCM_LLMM1_AVAILABLE = hasattr(torch.ops._rocm_C, "LLMM1")
+    return _ROCM_LLMM1_AVAILABLE
+
+
+_GFX936_QWEN35_LLMM1_SHAPES = {
+    (1, 5120, 17408),  # MLP down projection
+    (1, 5120, 6144),  # GDN/full-attention output projection
+    (1, 16480, 5120),  # packed GDN q/k/v/z/b/a projection
+}
+
 MOE_LAYER_ROUTER_GATE_SUFFIXES = {
     "gate",
     "router",
@@ -220,6 +241,25 @@ def rocm_unquantized_gemm_impl(
                 return torch.nn.functional.linear(x, weight)
             finally:
                 torch.backends.cuda.preferred_blas_library(previous_blas)
+
+        use_qwen35_llmm1 = (
+            (n, m, k) in _GFX936_QWEN35_LLMM1_SHAPES
+            and os.environ.get("VLLM_ROCM_USE_GFX936_LLMM1", "1").lower()
+            not in ("0", "false", "off")
+            and rocm_llmm1_available()
+            and bias is None
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and weight.dtype == x.dtype
+            and weight.device == x.device
+            and weight.ndim == 2
+            and x.is_contiguous()
+            and weight.is_contiguous()
+        )
+        if use_qwen35_llmm1:
+            x_2d = x.reshape(n, k)
+            out = ops.LLMM1(weight, x_2d, 2)
+            return out.reshape(*x.shape[:-1], m)
 
         if not (
             use_aiter_triton_gemm(n, m, k, x.dtype)
