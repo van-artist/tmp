@@ -2187,6 +2187,10 @@ def LLMM1(a: torch.Tensor, b: torch.Tensor, rows_per_block: int) -> torch.Tensor
     return torch.ops._rocm_C.LLMM1(a, b, rows_per_block)
 
 
+def qwen35_wave64_gemv(weight: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
+    return torch.ops._rocm_C.qwen35_wave64_gemv(weight, input)
+
+
 def wvSplitK(
     a: torch.Tensor, b: torch.Tensor, cu_count: int, bias: torch.Tensor = None
 ) -> torch.Tensor:

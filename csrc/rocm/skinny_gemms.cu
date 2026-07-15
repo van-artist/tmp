@@ -8,6 +8,7 @@
 
 #include <stdexcept>
 #include <algorithm>
+#include <limits>
 
 #include "../cuda_compat.h"
 #include "dispatch_utils.h"
@@ -284,6 +285,116 @@ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
   });
 
   return out_c;
+}
+
+template <typename pair_t>
+__device__ __forceinline__ float qwen35_pair_dot(pair_t lhs, pair_t rhs) {
+  const float2 a = __s22float2(lhs);
+  const float2 b = __s22float2(rhs);
+  return a.x * b.x + a.y * b.y;
+}
+
+// Each block streams two complete weight rows. Threads own disjoint K/8
+// vectors, accumulate both rows in FP32, reduce within wave64, then let the
+// first wave combine the per-wave partials. The fixed launch width supports
+// large K without exceeding the device thread limit.
+template <typename scalar_t>
+__global__ void qwen35_wave64_gemv_kernel(const scalar_t* weight,
+                                           const scalar_t* input,
+                                           scalar_t* output, int K) {
+  using scalar2_t = typename scalar2<scalar_t>::type;
+  using device_scalar_t = typename scalar<scalar_t>::type;
+  const int wave = threadIdx.x / WARP_SIZE;
+  const int lane = threadIdx.x % WARP_SIZE;
+  const int wave_count = blockDim.x / WARP_SIZE;
+  __shared__ float wave_partials[2][16];
+
+  const auto* weight4 = reinterpret_cast<const float4*>(weight);
+  const auto* input2 = reinterpret_cast<const scalar2_t*>(input);
+  const int vector_count = K / 8;
+  const int row0_base = blockIdx.x * 2 * vector_count;
+  float row0_sum = 0.0f;
+  float row1_sum = 0.0f;
+  for (int vector = threadIdx.x; vector < vector_count;
+       vector += blockDim.x) {
+    const float4 row0 = load_ntmprl(weight4 + row0_base + vector);
+    const float4 row1 =
+        load_ntmprl(weight4 + row0_base + vector_count + vector);
+    const auto* row0_pairs = reinterpret_cast<const scalar2_t*>(&row0);
+    const auto* row1_pairs = reinterpret_cast<const scalar2_t*>(&row1);
+    const int input_pair = vector * 4;
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+      const scalar2_t x = input2[input_pair + pair];
+      row0_sum += qwen35_pair_dot(row0_pairs[pair], x);
+      row1_sum += qwen35_pair_dot(row1_pairs[pair], x);
+    }
+  }
+
+#pragma unroll
+  for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+    row0_sum += __shfl_down(row0_sum, offset);
+    row1_sum += __shfl_down(row1_sum, offset);
+  }
+  if (lane == 0) {
+    wave_partials[0][wave] = row0_sum;
+    wave_partials[1][wave] = row1_sum;
+  }
+  __syncthreads();
+
+  if (wave == 0) {
+    row0_sum = lane < wave_count ? wave_partials[0][lane] : 0.0f;
+    row1_sum = lane < wave_count ? wave_partials[1][lane] : 0.0f;
+#pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+      row0_sum += __shfl_down(row0_sum, offset);
+      row1_sum += __shfl_down(row1_sum, offset);
+    }
+    if (lane == 0) {
+      auto* out = reinterpret_cast<device_scalar_t*>(output);
+      out[blockIdx.x * 2] = __float2s<device_scalar_t>(row0_sum);
+      out[blockIdx.x * 2 + 1] = __float2s<device_scalar_t>(row1_sum);
+    }
+  }
+}
+
+torch::Tensor qwen35_wave64_gemv(const at::Tensor& weight,
+                                 const at::Tensor& input) {
+  TORCH_CHECK(weight.is_cuda() && input.is_cuda(),
+              "qwen35_wave64_gemv expects device tensors");
+  TORCH_CHECK(weight.is_contiguous() && input.is_contiguous(),
+              "qwen35_wave64_gemv expects contiguous tensors");
+  TORCH_CHECK(weight.dim() == 2 && input.dim() == 2 && input.size(0) == 1,
+              "qwen35_wave64_gemv expects weight[M,K] and input[1,K]");
+  TORCH_CHECK(weight.scalar_type() == input.scalar_type(),
+              "qwen35_wave64_gemv requires matching dtypes");
+  TORCH_CHECK(input.scalar_type() == torch::kBFloat16 ||
+                  input.scalar_type() == torch::kFloat16,
+              "qwen35_wave64_gemv supports BF16 and FP16");
+  const int64_t M64 = weight.size(0);
+  const int64_t K64 = weight.size(1);
+  TORCH_CHECK(input.size(1) == K64 && K64 % 8 == 0 && M64 % 2 == 0,
+              "qwen35_wave64_gemv requires K%8=0 and M%2=0");
+  TORCH_CHECK(M64 <= std::numeric_limits<int>::max() &&
+                  K64 <= std::numeric_limits<int>::max(),
+              "qwen35_wave64_gemv shape exceeds int32 indexing");
+
+  auto output = torch::empty({1, M64}, input.options());
+  const int vectors = static_cast<int>(K64 / 8);
+  const int rounded_vectors =
+      ((vectors + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
+  const int threads = std::min(1024, std::max(128, rounded_vectors));
+  const int blocks = static_cast<int>(M64 / 2);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(
+      input.scalar_type(), "qwen35_wave64_gemv", [&] {
+        qwen35_wave64_gemv_kernel<scalar_t>
+            <<<blocks, threads, 0, stream>>>(
+                weight.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(), static_cast<int>(K64));
+      });
+  return output;
 }
 
 #define DOT2C(V0, V2, V3)                                                     \

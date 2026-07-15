@@ -190,7 +190,7 @@ def rocm_unquantized_gemm_impl(
     # SplitK heuristics, and send every other shape straight to the unchanged
     # PyTorch fallback.
     if on_gfx936():
-        if not (
+        use_aiter = (
             use_aiter_triton_gemm(n, m, k, x.dtype)
             and bias is None
             and x.is_cuda
@@ -199,24 +199,47 @@ def rocm_unquantized_gemm_impl(
             and weight.ndim == 2
             and x.is_contiguous()
             and weight.is_contiguous()
-        ):
-            return torch.nn.functional.linear(x, weight, bias)
-
-        try:
-            from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
-        except (AttributeError, ImportError, OSError):
-            return torch.nn.functional.linear(x, weight, bias)
-
-        x_2d = x.reshape(n, k)
-        out_2d = x.new_empty((n, m))
-        out_2d = gemm_a16w16(
-            x_2d,
-            weight,
-            dtype=x.dtype,
-            y=out_2d,
-            config=_GFX936_QWEN35_AITER_GEMM_CONFIGS[(n, m, k)],
         )
-        return out_2d.reshape(*x.shape[:-1], m)
+
+        if use_aiter:
+            try:
+                from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+            except (AttributeError, ImportError, OSError):
+                use_aiter = False
+
+        if use_aiter:
+            x_2d = x.reshape(n, k)
+            out_2d = x.new_empty((n, m))
+            out_2d = gemm_a16w16(
+                x_2d,
+                weight,
+                dtype=x.dtype,
+                y=out_2d,
+                config=_GFX936_QWEN35_AITER_GEMM_CONFIGS[(n, m, k)],
+            )
+            return out_2d.reshape(*x.shape[:-1], m)
+
+        wave64_shapes = {
+            (5120, 17408),  # MLP down
+            (16480, 5120),  # packed GDN q/k/v/z/b/a
+        }
+        if (
+            n == 1
+            and (m, k) in wave64_shapes
+            and bias is None
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and weight.dtype == x.dtype
+            and weight.device == x.device
+            and x.is_contiguous()
+            and weight.is_contiguous()
+            and hasattr(torch.ops._rocm_C, "qwen35_wave64_gemv")
+        ):
+            x_2d = x.reshape(1, k)
+            out_2d = ops.qwen35_wave64_gemv(weight, x_2d)
+            return out_2d.reshape(*x.shape[:-1], m)
+
+        return torch.nn.functional.linear(x, weight, bias)
 
     cu_count = num_compute_units()
 
