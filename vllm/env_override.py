@@ -5,6 +5,22 @@ import importlib.util
 import os
 
 
+def _maybe_set_dcu_rocblas_tensile_override():
+    """Install the tuned gfx936 Qwen3.5 GEMM map before torch loads rocBLAS."""
+    variable = "ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH"
+    if variable in os.environ or not os.path.isdir("/opt/dtk"):
+        return
+
+    override_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "assets",
+        "rocblas",
+        "gfx936_qwen35_prefill_gemm.csv",
+    )
+    if os.path.isfile(override_path):
+        os.environ[variable] = override_path
+
+
 def _get_torch_cuda_version():
     """Peripheral function to _maybe_set_cuda_compatibility_path().
     PyTorch version must not be determined by importing directly
@@ -82,6 +98,7 @@ def _maybe_set_cuda_compatibility_path():
     os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(new_paths)
 
 
+_maybe_set_dcu_rocblas_tensile_override()
 _maybe_set_cuda_compatibility_path()
 
 import torch

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utility methods for model layers."""
 
+import os
 from collections.abc import Callable
 
 import torch
@@ -210,6 +211,7 @@ def rocm_unquantized_gemm_impl(
             and x.is_contiguous()
             and weight.is_contiguous()
             and not vllm_is_batch_invariant()
+            and "ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH" not in os.environ
         )
         if use_gateup_prefill_hipblaslt:
             previous_blas = torch.backends.cuda.preferred_blas_library()
