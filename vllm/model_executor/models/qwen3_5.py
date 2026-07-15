@@ -31,8 +31,6 @@ import torch
 from einops import rearrange
 from torch import nn
 
-from vllm import _custom_ops as ops
-from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     VllmConfig,
@@ -113,31 +111,6 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
-
-
-def _can_defer_final_norm(vllm_config: VllmConfig) -> bool:
-    if not current_platform.is_rocm() or not envs.VLLM_ROCM_USE_SKINNY_GEMM:
-        return False
-
-    from vllm.platforms.rocm import on_gfx936
-
-    config = vllm_config.model_config.hf_text_config
-    parallel_config = vllm_config.parallel_config
-    return (
-        on_gfx936()
-        and vllm_config.model_config.dtype == torch.bfloat16
-        and vllm_config.model_config.runner_type == "generate"
-        and vllm_config.quant_config is None
-        and vllm_config.lora_config is None
-        and vllm_config.speculative_config is None
-        and parallel_config.tensor_parallel_size == 1
-        and parallel_config.pipeline_parallel_size == 1
-        and parallel_config.data_parallel_size == 1
-        and parallel_config.prefill_context_parallel_size == 1
-        and parallel_config.decode_context_parallel_size == 1
-        and config.hidden_size == 5120
-        and config.vocab_size == 248320
-    )
 
 
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
@@ -364,13 +337,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
     }
 )
 class Qwen3_5Model(Qwen3NextModel):
-    def __init__(
-        self,
-        *,
-        vllm_config: VllmConfig,
-        prefix: str = "",
-        defer_final_norm: bool = False,
-    ):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super(Qwen3NextModel, self).__init__()
 
         config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig = (
@@ -382,7 +349,6 @@ class Qwen3_5Model(Qwen3NextModel):
         self.num_redundant_experts = eplb_config.num_redundant_experts
 
         self.config = config
-        self.defer_final_norm = defer_final_norm
 
         self.vocab_size = config.vocab_size
 
@@ -632,12 +598,8 @@ class Qwen3_5ForCausalLMBase(
         super().__init__()
         self.config = config
         self.scheduler_config = scheduler_config
-        self._gfx936_top1_eligible = _can_defer_final_norm(vllm_config)
-        self._defer_final_norm = False
         self.model = Qwen3_5Model(
-            vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "model"),
-            defer_final_norm=False,
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
 
         if get_pp_group().is_last_rank:
@@ -653,10 +615,6 @@ class Qwen3_5ForCausalLMBase(
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self._gfx936_top1_normalized_hidden: torch.Tensor | None = None
-        self._gfx936_top1_local_values: torch.Tensor | None = None
-        self._gfx936_top1_local_indices: torch.Tensor | None = None
-        self._gfx936_top1_result: torch.Tensor | None = None
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -689,73 +647,7 @@ class Qwen3_5ForCausalLMBase(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        if self._defer_final_norm:
-            hidden_states = self.model.norm(hidden_states)
         return self.logits_processor(self.lm_head, hidden_states)
-
-    def initialize_gfx936_top1(self) -> bool:
-        if not self._gfx936_top1_eligible or not isinstance(
-            self.lm_head, ParallelLMHead
-        ):
-            return False
-
-        weight = self.lm_head.weight
-        if (
-            self.lm_head.bias is not None
-            or self.logits_processor.logits_as_input
-            or self.logits_processor.soft_cap is not None
-            or self.logits_processor.scale != 1.0
-            or self.logits_processor.org_vocab_size != weight.shape[0]
-            or weight.device.type != "cuda"
-            or weight.dtype != torch.bfloat16
-            or not weight.is_contiguous()
-            or tuple(weight.shape) != (248320, 5120)
-            or self.model.norm.weight.dtype != torch.bfloat16
-            or not self.model.norm.weight.is_contiguous()
-            or tuple(self.model.norm.weight.shape) != (5120,)
-            or not hasattr(torch.ops._rocm_C, "LLMM1RMSNormTop1")
-        ):
-            return False
-
-        num_candidates = weight.shape[0] // 2
-        self._gfx936_top1_normalized_hidden = torch.empty(
-            1, weight.shape[1], device=weight.device, dtype=torch.bfloat16
-        )
-        self._gfx936_top1_local_values = torch.empty(
-            num_candidates, device=weight.device, dtype=torch.float32
-        )
-        self._gfx936_top1_local_indices = torch.empty(
-            num_candidates, device=weight.device, dtype=torch.int32
-        )
-        self._gfx936_top1_result = torch.empty(
-            1, device=weight.device, dtype=torch.int32
-        )
-        self._defer_final_norm = True
-        self.model.defer_final_norm = True
-        return True
-
-    def compute_gfx936_top1(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        normalized_hidden = self._gfx936_top1_normalized_hidden
-        local_values = self._gfx936_top1_local_values
-        local_indices = self._gfx936_top1_local_indices
-        result = self._gfx936_top1_result
-        assert normalized_hidden is not None
-        assert local_values is not None
-        assert local_indices is not None
-        assert result is not None
-
-        ops.LLMM1RMSNormTop1(
-            self.lm_head.weight,
-            hidden_states,
-            self.model.norm.weight,
-            normalized_hidden,
-            local_values,
-            local_indices,
-            result,
-            self.model.norm.variance_epsilon,
-            80,
-        )
-        return result.view(1, 1)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(

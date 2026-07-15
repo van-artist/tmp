@@ -132,9 +132,6 @@ class LogitBiasLogitsProcessor(LogitsProcessor):
         outcome of argmax in greedy sampling."""
         return False
 
-    def is_active(self) -> bool:
-        return bool(self.biases)
-
     def update_state(self, batch_update: BatchUpdate | None):
         needs_update = process_dict_updates(
             self.biases, batch_update, lambda params, _, __: params.logit_bias or None
@@ -190,9 +187,6 @@ class MinTokensLogitsProcessor(LogitsProcessor):
         """By censoring stop tokens, min-tokens can change the outcome
         of the argmax operation in greedy sampling."""
         return False
-
-    def is_active(self) -> bool:
-        return bool(self.min_toks)
 
     @staticmethod
     def add_request(

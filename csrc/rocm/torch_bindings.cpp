@@ -20,31 +20,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor");
   rocm_ops.impl("LLMM1", torch::kCUDA, &LLMM1);
 
-  rocm_ops.def(
-      "LLMM1FP32Top1(Tensor in_a, Tensor in_b, Tensor! local_values, "
-      "Tensor! local_indices, Tensor! result, int reduction_blocks) -> ()");
-  rocm_ops.impl("LLMM1FP32Top1", torch::kCUDA, &LLMM1FP32Top1);
-
-  rocm_ops.def(
-      "LLMM1Top1(Tensor in_a, Tensor in_b, Tensor! local_values, "
-      "Tensor! local_indices, Tensor! result, int reduction_blocks) -> ()");
-  rocm_ops.impl("LLMM1Top1", torch::kCUDA, &LLMM1Top1);
-
-  rocm_ops.def(
-      "LLMM1RMSNormFP32Top1(Tensor in_a, Tensor hidden, Tensor norm_weight, "
-      "Tensor! normalized_hidden, Tensor! local_values, "
-      "Tensor! local_indices, Tensor! result, float epsilon, "
-      "int reduction_blocks) -> ()");
-  rocm_ops.impl("LLMM1RMSNormFP32Top1", torch::kCUDA,
-                &LLMM1RMSNormFP32Top1);
-
-  rocm_ops.def(
-      "LLMM1RMSNormTop1(Tensor in_a, Tensor hidden, Tensor norm_weight, "
-      "Tensor! normalized_hidden, Tensor! local_values, "
-      "Tensor! local_indices, Tensor! result, float epsilon, "
-      "int reduction_blocks) -> ()");
-  rocm_ops.impl("LLMM1RMSNormTop1", torch::kCUDA, &LLMM1RMSNormTop1);
-
   // Custom gemm op for skinny matrix-matrix multiplication
   rocm_ops.def(
       "wvSplitK(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount) -> "
