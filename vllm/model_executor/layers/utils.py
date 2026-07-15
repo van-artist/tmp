@@ -233,10 +233,10 @@ def rocm_unquantized_gemm_impl(
             and weight.device == x.device
             and x.is_contiguous()
             and weight.is_contiguous()
-            and hasattr(torch.ops._rocm_C, "qwen35_wave64_gemv")
+            and hasattr(torch.ops._rocm_C, "LLMM1")
         ):
             x_2d = x.reshape(1, k)
-            out_2d = ops.qwen35_wave64_gemv(weight, x_2d)
+            out_2d = ops.LLMM1(weight, x_2d, 2)
             return out_2d.reshape(*x.shape[:-1], m)
 
         return torch.nn.functional.linear(x, weight, bias)

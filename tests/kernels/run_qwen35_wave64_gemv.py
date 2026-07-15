@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone gfx936 Qwen3.5 large-K GEMV correctness and latency check."""
+"""Standalone gfx936 Qwen3.5 rows2 LLMM1 correctness and latency check."""
 
 import math
 import statistics
@@ -38,20 +38,20 @@ def run_case(name: str, rows: int, width: int) -> None:
     weight = torch.randn((rows, width), device="cuda", dtype=torch.bfloat16)
 
     reference = torch.nn.functional.linear(x, weight)
-    candidate = ops.qwen35_wave64_gemv(weight, x)
+    candidate = ops.LLMM1(weight, x, 2)
     diff = (candidate.float() - reference.float()).abs()
     max_abs = diff.max().item()
     mean_abs = diff.mean().item()
     torch.testing.assert_close(candidate, reference, atol=1.5625e-2, rtol=2.0e-2)
 
     baseline_us = measure_us(lambda: torch.nn.functional.linear(x, weight))
-    wave64_us = measure_us(lambda: ops.qwen35_wave64_gemv(weight, x))
+    wave64_us = measure_us(lambda: ops.LLMM1(weight, x, 2))
     print(
         f"{name}: shape=(1,{width})x({rows},{width}) "
         f"max_abs={max_abs:.8f} mean_abs={mean_abs:.8f}"
     )
     print(
-        f"  hipblas={baseline_us:.2f} us wave64={wave64_us:.2f} us "
+        f"  hipblas={baseline_us:.2f} us llmm1_rows2={wave64_us:.2f} us "
         f"speedup={baseline_us / wave64_us:.3f}x"
     )
 
@@ -59,7 +59,7 @@ def run_case(name: str, rows: int, width: int) -> None:
 def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("A ROCm device is required")
-    if not hasattr(torch.ops._rocm_C, "qwen35_wave64_gemv"):
+    if not hasattr(torch.ops._rocm_C, "LLMM1"):
         raise RuntimeError("Rebuild/install the wheel: custom op is missing")
     props = torch.cuda.get_device_properties(0)
     print(f"device={props.name}")
