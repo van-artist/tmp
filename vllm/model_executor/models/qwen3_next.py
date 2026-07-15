@@ -33,6 +33,10 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.model_executor.layers.fla.ops import (
+    chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
+    chunk_gated_delta_rule_into as fla_chunk_gated_delta_rule_into,
+)
+from vllm.model_executor.layers.fla.ops import (
     can_use_exact_local_cumsum,
     can_use_qwen35_prefill_conv_fusion,
     fused_post_conv_prep,
@@ -40,17 +44,11 @@ from vllm.model_executor.layers.fla.ops import (
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_sigmoid_gating_delta_rule_update,
 )
-from vllm.model_executor.layers.fla.ops import (
-    chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
-)
-from vllm.model_executor.layers.fla.ops import (
-    chunk_gated_delta_rule_into as fla_chunk_gated_delta_rule_into,
-)
 from vllm.model_executor.layers.fla.ops.chunk import l2norm_fwd
-from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.fused_qk_norm_rope import (
     fused_qk_rmsnorm_rope_gate,
 )
+from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3NextRMSNorm,
 )
