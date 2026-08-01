@@ -20,6 +20,11 @@ from vllm.utils.torch_utils import direct_register_custom_op
 _QWEN35_HIDDEN_SIZE = 5120
 _QWEN35_INTERMEDIATE_SIZE = 17408
 _QWEN35_GATE_UP_SIZE = 2 * _QWEN35_INTERMEDIATE_SIZE
+_QWEN35_TP2_INTERMEDIATE_SIZE = _QWEN35_INTERMEDIATE_SIZE // 2
+_QWEN35_SUPPORTED_LOCAL_INTERMEDIATE_SIZES = (
+    _QWEN35_INTERMEDIATE_SIZE,
+    _QWEN35_TP2_INTERMEDIATE_SIZE,
+)
 
 
 @triton.jit
@@ -77,15 +82,19 @@ def qwen35_bf16_gateup_silu_impl(
     weight: torch.Tensor,
 ) -> torch.Tensor:
     num_tokens = x.numel() // x.shape[-1]
+    local_intermediate_size = weight.shape[0] // 2 if weight.ndim == 2 else 0
     use_fused = (
         envs.VLLM_ROCM_QWEN35_FUSED_GATEUP_SILU
         and current_platform.is_rocm()
         and x.is_cuda
         and x.dtype == torch.bfloat16
+        and weight.ndim == 2
         and weight.dtype == x.dtype
         and weight.device == x.device
         and x.shape[-1] == _QWEN35_HIDDEN_SIZE
-        and weight.shape == (_QWEN35_GATE_UP_SIZE, _QWEN35_HIDDEN_SIZE)
+        and weight.shape[0] == 2 * local_intermediate_size
+        and weight.shape[1] == _QWEN35_HIDDEN_SIZE
+        and local_intermediate_size in _QWEN35_SUPPORTED_LOCAL_INTERMEDIATE_SIZES
         and num_tokens == 1
         and x.is_contiguous()
         and weight.is_contiguous()
@@ -97,15 +106,13 @@ def qwen35_bf16_gateup_silu_impl(
 
     if use_fused:
         x_2d = x.reshape(1, _QWEN35_HIDDEN_SIZE)
-        output = x.new_empty((1, _QWEN35_INTERMEDIATE_SIZE))
-        _qwen35_bf16_gateup_silu_kernel[
-            (triton.cdiv(_QWEN35_INTERMEDIATE_SIZE, 32),)
-        ](
+        output = x.new_empty((1, local_intermediate_size))
+        _qwen35_bf16_gateup_silu_kernel[(triton.cdiv(local_intermediate_size, 32),)](
             x_2d,
             weight,
             output,
             K=_QWEN35_HIDDEN_SIZE,
-            D=_QWEN35_INTERMEDIATE_SIZE,
+            D=local_intermediate_size,
             BLOCK_M=16,
             BLOCK_D=32,
             BLOCK_K=512,
@@ -115,10 +122,10 @@ def qwen35_bf16_gateup_silu_impl(
             matrix_instr_nonkdim=16,
             kpack=1,
         )
-        return output.reshape(*x.shape[:-1], _QWEN35_INTERMEDIATE_SIZE)
+        return output.reshape(*x.shape[:-1], local_intermediate_size)
 
     gate_up = rocm_unquantized_gemm_impl(x, weight)
-    output = x.new_empty((*x.shape[:-1], _QWEN35_INTERMEDIATE_SIZE))
+    output = x.new_empty((*x.shape[:-1], local_intermediate_size))
     torch.ops._C.silu_and_mul(output, gate_up)
     return output
 

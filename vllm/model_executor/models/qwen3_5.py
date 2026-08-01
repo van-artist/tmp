@@ -322,7 +322,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 and quant_config is None
                 and config.hidden_size == 5120
                 and config.intermediate_size == 17408
-                and self.mlp.gate_up_proj.tp_size == 1
+                and self.mlp.gate_up_proj.tp_size in (1, 2)
             ):
                 self.mlp.gate_up_proj._qwen35_bf16_fused_silu = True
         else:

@@ -34,9 +34,18 @@ def rocm_llmm1_available() -> bool:
 
 
 _GFX936_QWEN35_LLMM1_SHAPES = {
+    # TP1 shapes.
     (1, 5120, 17408),  # MLP down projection
     (1, 5120, 6144),  # GDN/full-attention output projection
     (1, 16480, 5120),  # packed GDN q/k/v/z/b/a projection
+    # TP2 rank-local shapes. Column-parallel projections shard M, while
+    # row-parallel projections shard K; their existing wrappers retain the
+    # required collective after this local GEMV.
+    (1, 17408, 5120),  # MLP gate/up projection
+    (1, 8240, 5120),  # packed GDN q/k/v/z/b/a projection
+    (1, 7168, 5120),  # full-attention q/k/v/gate projection
+    (1, 5120, 8704),  # MLP down projection before all-reduce
+    (1, 5120, 3072),  # GDN/full-attention output before all-reduce
 }
 
 MOE_LAYER_ROUTER_GATE_SUFFIXES = {
@@ -209,9 +218,9 @@ def rocm_unquantized_gemm_impl(
     k = weight.shape[1]
 
     # gfx936 is deliberately not part of the upstream gfx9 skinny-kernel
-    # allowlist. Handle its three tuned Qwen3.5 shapes before calculating the
-    # SplitK heuristics, and send every other shape straight to the unchanged
-    # PyTorch fallback.
+    # allowlist. Handle the exact TP1/TP2 Qwen3.5 rank-local shapes before
+    # calculating the SplitK heuristics, and send every other shape straight
+    # to the unchanged PyTorch fallback.
     if on_gfx936():
         # On the contest's exact 4096-token Qwen3.5 gate/up projection,
         # hipBLASLt is measurably faster than hipBLAS while producing bitwise
