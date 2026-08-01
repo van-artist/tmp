@@ -51,7 +51,7 @@ def chunk_gated_delta_rule_fwd(
     use_fused_solve_recompute = (
         out is not None
         and cu_seqlens is None
-        and q.shape == (1, 4096, 16, 128)
+        and q.shape in ((1, 4096, 16, 128), (1, 4096, 8, 128))
         and out.shape == v.shape
         and can_use_fused(k=k, v=v, beta=beta, g=g, A=A)
     )

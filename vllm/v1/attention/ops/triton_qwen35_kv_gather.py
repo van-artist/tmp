@@ -143,7 +143,13 @@ def gather_qwen35_paged_kv(
 ) -> None:
     """Gather the exact Qwen3.5 784x4x256 NHD cache into dense K/V."""
     page_size = 784
-    row_size = 4 * 256
+    num_kv_heads = key_cache.shape[2]
+    head_size = key_cache.shape[3]
+    assert (num_kv_heads, head_size) in ((4, 256), (2, 256))
+    assert value_cache.shape[2:] == (num_kv_heads, head_size)
+    assert dense_key.shape[1:] == (num_kv_heads, head_size)
+    assert dense_value.shape[1:] == (num_kv_heads, head_size)
+    row_size = num_kv_heads * head_size
     _gather_qwen35_nhd_pages_kernel[
         (page_size, triton.cdiv(total_tokens, page_size))
     ](
@@ -185,8 +191,9 @@ def stage_qwen35_continuation_kv(
     read of the just-written cache rows and one kernel launch.
     """
     page_size = 784
-    num_kv_heads = 4
-    head_size = 256
+    num_kv_heads = key.shape[1]
+    head_size = key.shape[2]
+    assert (num_kv_heads, head_size) in ((4, 256), (2, 256))
     row_size = num_kv_heads * head_size
     total_tokens = prefix_tokens + query_tokens
 

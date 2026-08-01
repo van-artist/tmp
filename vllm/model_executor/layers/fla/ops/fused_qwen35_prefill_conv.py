@@ -27,6 +27,22 @@ _WIDTH = 4
 _QKV = 2 * _H * _K + _HV * _V
 
 
+def _local_gdn_geometry(
+    mixed_qkv: torch.Tensor, A_log: torch.Tensor
+) -> tuple[int, int]:
+    """Return the supported TP1/TP2 rank-local (key heads, value heads)."""
+    num_v_heads = A_log.shape[0] if A_log.ndim == 1 else 0
+    num_k_heads = num_v_heads // 3
+    expected_qkv = 2 * num_k_heads * _K + num_v_heads * _V
+    if (
+        (num_k_heads, num_v_heads) not in ((_H, _HV), (_H // 2, _HV // 2))
+        or mixed_qkv.ndim != 2
+        or mixed_qkv.shape[1] != expected_qkv
+    ):
+        return 0, 0
+    return num_k_heads, num_v_heads
+
+
 @triton.jit
 def _conv_silu_bf16_tile(
     x_ptr,
@@ -599,28 +615,32 @@ def can_use_qwen35_prefill_conv_fusion(
     if not all(isinstance(t, torch.Tensor) for t in tensors):
         return False
     length = mixed_qkv.shape[0] if mixed_qkv.ndim == 2 else 0
+    num_k_heads, num_v_heads = _local_gdn_geometry(mixed_qkv, A_log)
+    qkv_size = 2 * num_k_heads * _K + num_v_heads * _V
+    packed_size = qkv_size + num_v_heads * _V + 2 * num_v_heads
     return (
         on_gfx936()
         and conv_bias is None
         and activation in ("silu", "swish")
         and all(t.is_cuda for t in tensors)
         and 3 <= length <= _T
-        and mixed_qkv.shape == (length, _QKV)
+        and num_k_heads > 0
+        and mixed_qkv.shape == (length, qkv_size)
         and mixed_qkv.dtype == torch.bfloat16
         # Qwen3.5 normally passes the qkv prefix of its packed 16480-wide
         # qkv/z/b/a projection.  The kernel addresses tokens through the
         # explicit stride, so both that production view and an isolated
         # contiguous fixture are exact.
         and mixed_qkv.stride(1) == 1
-        and mixed_qkv.stride(0) in (_QKV, 16480)
-        and conv_weight.shape == (_QKV, _WIDTH)
+        and mixed_qkv.stride(0) in (qkv_size, packed_size)
+        and conv_weight.shape == (qkv_size, _WIDTH)
         and conv_weight.dtype == torch.bfloat16
         and conv_weight.is_contiguous()
         and conv_state.ndim == 3
-        and conv_state.shape[1:] == (_QKV, _WIDTH - 1)
+        and conv_state.shape[1:] == (qkv_size, _WIDTH - 1)
         and conv_state.dtype == torch.bfloat16
         and conv_state.stride(1) == 1
-        and conv_state.stride(2) == _QKV
+        and conv_state.stride(2) == qkv_size
         and state_indices.shape == (1,)
         and state_indices.dtype == torch.int32
         and state_indices.is_contiguous()
@@ -629,14 +649,14 @@ def can_use_qwen35_prefill_conv_fusion(
         and has_initial_state.is_contiguous()
         and query_start_loc.shape == (2,)
         and query_start_loc.dtype == torch.int32
-        and a.shape == (length, _HV)
-        and b.shape == (length, _HV)
+        and a.shape == (length, num_v_heads)
+        and b.shape == (length, num_v_heads)
         and a.dtype == torch.bfloat16
         and b.dtype == torch.bfloat16
         and a.stride(1) == 1
         and b.stride(1) == 1
-        and A_log.shape == (_HV,)
-        and dt_bias.shape == (_HV,)
+        and A_log.shape == (num_v_heads,)
+        and dt_bias.shape == (num_v_heads,)
         and A_log.dtype in (torch.bfloat16, torch.float32)
         and dt_bias.dtype in (torch.bfloat16, torch.float32)
         and A_log.is_contiguous()
@@ -665,14 +685,19 @@ def fused_qwen35_prefill_conv_prep(
     normalizes Q/K without a separate kernel launch.
     """
     length = mixed_qkv.shape[0]
+    num_k_heads, num_v_heads = _local_gdn_geometry(mixed_qkv, A_log)
+    if num_k_heads == 0:
+        raise ValueError("unsupported Qwen3.5 TP-local GDN geometry")
     q = torch.empty(
-        (length, _H, _K), device=mixed_qkv.device, dtype=mixed_qkv.dtype
+        (length, num_k_heads, _K), device=mixed_qkv.device, dtype=mixed_qkv.dtype
     )
     k = torch.empty_like(q)
     v = torch.empty(
-        (length, _HV, _V), device=mixed_qkv.device, dtype=mixed_qkv.dtype
+        (length, num_v_heads, _V), device=mixed_qkv.device, dtype=mixed_qkv.dtype
     )
-    g = torch.empty((length, _HV), device=mixed_qkv.device, dtype=torch.float32)
+    g = torch.empty(
+        (length, num_v_heads), device=mixed_qkv.device, dtype=torch.float32
+    )
     beta = torch.empty_like(g)
 
     if length != _T:
@@ -684,7 +709,9 @@ def fused_qwen35_prefill_conv_prep(
         qk_nt = triton.cdiv(length, qk_block_t)
         nt = triton.cdiv(length, block_t)
         ngt = triton.cdiv(length, gate_t)
-        grid = (_H * qk_nt + _HV * nt + _HV * ngt,)
+        grid = (
+            num_k_heads * qk_nt + num_v_heads * nt + num_v_heads * ngt,
+        )
         _conv_prep_cumsum_tail_kernel[grid](
             mixed_qkv,
             conv_weight,
@@ -712,8 +739,8 @@ def fused_qwen35_prefill_conv_prep(
             k.stride(0),
             v.stride(0),
             T=length,
-            H=_H,
-            HV=_HV,
+            H=num_k_heads,
+            HV=num_v_heads,
             K=_K,
             V=_V,
             WIDTH=_WIDTH,
@@ -736,7 +763,7 @@ def fused_qwen35_prefill_conv_prep(
     nt = _T // block_t
     gate_t = 64
     ngt = _T // gate_t
-    grid = (_H * qk_nt + _HV * nt + _HV * ngt,)
+    grid = (num_k_heads * qk_nt + num_v_heads * nt + num_v_heads * ngt,)
     _conv_prep_cumsum_4096_kernel[grid](
         mixed_qkv,
         conv_weight,
@@ -770,8 +797,8 @@ def fused_qwen35_prefill_conv_prep(
         BLOCK_T=block_t,
         GATE_T=gate_t,
         T=_T,
-        H=_H,
-        HV=_HV,
+        H=num_k_heads,
+        HV=num_v_heads,
         K=_K,
         V=_V,
         WIDTH=_WIDTH,
@@ -784,14 +811,14 @@ def fused_qwen35_prefill_conv_prep(
     if not fuse_qk_norm:
         norm_block_t = 16
         norm_nt = _T // norm_block_t
-        _qk_norm_4096_inplace_kernel[(_H * norm_nt,)](
+        _qk_norm_4096_inplace_kernel[(num_k_heads * norm_nt,)](
             q,
             k,
             q.stride(0),
             k.stride(0),
             NT=norm_nt,
             BLOCK_T=norm_block_t,
-            H=_H,
+            H=num_k_heads,
             K=_K,
             num_warps=2,
             num_stages=1,

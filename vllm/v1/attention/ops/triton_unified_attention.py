@@ -1032,8 +1032,7 @@ def unified_attention(
         assert (
             max_seqlen_q > 1
             and block_size == 784
-            and num_query_heads == 24
-            and num_kv_heads == 4
+            and (num_query_heads, num_kv_heads) in ((24, 4), (12, 2))
             and head_size == 256
             and q.dtype == torch.bfloat16
         )
@@ -1122,8 +1121,7 @@ def unified_attention(
         max_seqlen_q == 1
         and current_platform.is_rocm()
         and block_size == 784
-        and num_query_heads == 24
-        and num_kv_heads == 4
+        and (num_query_heads, num_kv_heads) in ((24, 4), (12, 2))
         and head_size == 256
         and q.dtype == torch.bfloat16
         and k.dtype == torch.bfloat16

@@ -486,7 +486,7 @@ class GPUModelRunner(
                 and self.speculative_config is None
                 and self.lora_config is None
                 and self.use_async_scheduling
-                and self.parallel_config.tensor_parallel_size == 1
+                and self.parallel_config.tensor_parallel_size in (1, 2)
                 and self.parallel_config.pipeline_parallel_size == 1
                 and self.dcp_world_size == 1
                 and self.uses_xdrope_dim == 0

@@ -220,11 +220,13 @@ def can_use_fused(
 
     return (
         on_gfx936()
-        and k.shape == (1, 4096, 16, 128)
-        and v.shape == (1, 4096, 48, 128)
-        and beta.shape == (1, 4096, 48)
-        and g.shape == (1, 4096, 48)
-        and A.shape == (1, 4096, 48, 64)
+        and k.shape in ((1, 4096, 16, 128), (1, 4096, 8, 128))
+        and v.ndim == 4
+        and v.shape[0:2] == (1, 4096)
+        and (k.shape[2], v.shape[2]) in ((16, 48), (8, 24))
+        and v.shape[3] == 128
+        and beta.shape == g.shape == (1, 4096, v.shape[2])
+        and A.shape == (1, 4096, v.shape[2], 64)
         and k.dtype == v.dtype == torch.bfloat16
         and beta.dtype == g.dtype == torch.float32
         and A.dtype == torch.float32
@@ -243,11 +245,13 @@ def solve_recompute_fused(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not can_use_fused(k, v, beta, g, A):
         raise ValueError("fused solve/recompute received an unsupported shape or dtype")
-    w = k.new_empty(1, 4096, 48, 128)
+    num_k_heads = k.shape[2]
+    num_v_heads = v.shape[2]
+    w = k.new_empty(1, 4096, num_v_heads, 128)
     u = torch.empty_like(v)
-    _solve_recompute_kernel[(64, 48)](
+    _solve_recompute_kernel[(64, num_v_heads)](
         A, k, v, beta, g, w, u,
-        H=48, Hg=16, K=128, V=128, T=4096, BT=64, BK=64, BV=64,
+        H=num_v_heads, Hg=num_k_heads, K=128, V=128, T=4096, BT=64, BK=64, BV=64,
         DOT_PRECISION=FLA_TRIL_PRECISION,
         num_warps=2,
         num_stages=1,

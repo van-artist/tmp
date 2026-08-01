@@ -306,19 +306,20 @@ def fused_qk_rmsnorm_rope_gate(
     head_block = triton.next_power_of_2(head_dim)
     rot_half_block = triton.next_power_of_2(half_rotary)
     num_warps = max(1, head_block // 64)
+    qwen35_local_heads = (num_q_heads, num_kv_heads) in ((24, 4), (12, 2))
     use_qwen35_head_tile = (
         _USE_GFX936_QWEN35_HEAD_TILE
         and q_gate.dtype == torch.bfloat16
         and k.dtype == q_gate.dtype
-        and num_q_heads == 24
-        and num_kv_heads == 4
+        and qwen35_local_heads
         and head_dim == 128
         and rotary_dim == 128
     )
     if use_qwen35_head_tile:
         # T remains grid dimension zero for every scheduler shape.  Four heads
         # and eight warps retain the original two warps/head even at T=1.
-        heads_per_program = 4
+        heads_per_program = 4 if num_kv_heads == 4 else 2
+        launch_num_warps = 2 * heads_per_program
         num_q_groups = num_q_heads // heads_per_program
         num_kv_groups = num_kv_heads // heads_per_program
         grid = (num_tokens, num_q_groups + num_kv_groups)
@@ -346,7 +347,7 @@ def fused_qk_rmsnorm_rope_gate(
             HEADS_PER_PROGRAM=heads_per_program,
             NUM_Q_GROUPS=num_q_groups,
             HAS_PASS=False,
-            num_warps=8,
+            num_warps=launch_num_warps,
             num_stages=1,
             waves_per_eu=1,
         )

@@ -141,11 +141,11 @@ def rmsnorm_gated_strided_z_inplace(
         and weight.dtype == x.dtype
         and z.device == x.device
         and weight.device == x.device
-        and num_heads == 48
+        and num_heads in (48, 24)
         and head_size == 128
-        and x.stride(0) == 6144
+        and x.stride(0) == num_heads * head_size
         and x.stride(1) == 128
-        and z.stride(0) == 16480
+        and z.stride(0) in (16480, 8240)
         and z.stride(1) == 128
         and weight.is_contiguous()
     )

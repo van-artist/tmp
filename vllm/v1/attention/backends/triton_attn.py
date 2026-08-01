@@ -190,8 +190,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 "Qwen3_5MoeForConditionalGeneration",
             )
             and self.block_size == 784
-            and self.num_heads_q == 24
-            and self.num_heads_kv == 4
+            and (self.num_heads_q, self.num_heads_kv) in ((24, 4), (12, 2))
             and self.headdim == 256
             and kv_cache_spec.dtype == torch.bfloat16
         )
@@ -243,12 +242,11 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 "Qwen3_5MoeForConditionalGeneration",
             )
             and self.block_size == 784
-            and self.num_heads_q == 24
-            and self.num_heads_kv == 4
+            and (self.num_heads_q, self.num_heads_kv) in ((24, 4), (12, 2))
             and self.headdim == 256
             and model_config.dtype == torch.bfloat16
             and kv_cache_spec.dtype == torch.bfloat16
-            and vllm_config.parallel_config.tensor_parallel_size == 1
+            and vllm_config.parallel_config.tensor_parallel_size in (1, 2)
             and vllm_config.parallel_config.decode_context_parallel_size == 1
             and vllm_config.parallel_config.prefill_context_parallel_size == 1
             and vllm_config.speculative_config is None
@@ -260,7 +258,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         if qwen35_gather_flash:
             max_model_len = model_config.max_model_len
             self.gfx936_dense_kv = torch.empty(
-                (2, max_model_len, 4, 256),
+                (2, max_model_len, self.num_heads_kv, 256),
                 dtype=torch.bfloat16,
                 device=device,
             )
@@ -613,8 +611,7 @@ class TritonAttentionImpl(AttentionImpl):
             and key_cache.dtype == torch.bfloat16
             and value_cache.dtype == torch.bfloat16
             and output_scale is None
-            and self.num_heads == 24
-            and self.num_kv_heads == 4
+            and (self.num_heads, self.num_kv_heads) in ((24, 4), (12, 2))
             and self.head_size == 256
             and key_cache.shape[1] == 784
             and self.logits_soft_cap == 0
@@ -822,8 +819,7 @@ class TritonAttentionImpl(AttentionImpl):
         assert on_gfx936()
         assert self.attn_type == AttentionType.DECODER
         assert self.kv_cache_dtype in ("auto", "bfloat16")
-        assert self.num_heads == 24
-        assert self.num_kv_heads == 4
+        assert (self.num_heads, self.num_kv_heads) in ((24, 4), (12, 2))
         assert self.head_size == 256
         assert self.kv_sharing_target_layer_name is None
         assert self.logits_soft_cap == 0
@@ -841,8 +837,8 @@ class TritonAttentionImpl(AttentionImpl):
         key_cache, value_cache = kv_cache.unbind(1)
         assert key_cache.dtype == torch.bfloat16
         assert value_cache.dtype == torch.bfloat16
-        assert key_cache.shape[1:] == (784, 4, 256)
-        assert value_cache.shape[1:] == (784, 4, 256)
+        assert key_cache.shape[1:] == (784, self.num_kv_heads, 256)
+        assert value_cache.shape[1:] == (784, self.num_kv_heads, 256)
 
         from vllm.v1.attention.ops.triton_qwen35_kv_gather import (
             stage_qwen35_continuation_kv,

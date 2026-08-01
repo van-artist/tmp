@@ -266,10 +266,9 @@ def can_use_exact_local_cumsum(
         output_local_cumsum
         and on_gfx936()
         and conv_output.shape == (4096, expected_dim)
-        and a.shape == b.shape == (4096, 48)
-        and A_log.shape == dt_bias.shape == (48,)
-        and num_k_heads == 16
-        and num_v_heads == 48
+        and a.shape == b.shape == (4096, num_v_heads)
+        and A_log.shape == dt_bias.shape == (num_v_heads,)
+        and (num_k_heads, num_v_heads) in ((16, 48), (8, 24))
         and head_k_dim == 128
         and head_v_dim == 128
         and conv_output.dtype == torch.bfloat16
